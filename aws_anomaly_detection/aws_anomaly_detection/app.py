@@ -478,3 +478,7 @@ a technician straight at the sensor most likely responsible.
   and demonstrated within a short competition demo.
         """
     )
+
+if st.session_state.auto_run:
+    time.sleep(AUTO_REFRESH_SECONDS)
+    st.rerun()
