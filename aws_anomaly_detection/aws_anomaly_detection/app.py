@@ -41,6 +41,11 @@ from utils.data_processing import (                                     # noqa: 
     format_value,
     history_to_display_table,
 )
+from utils.alert_engine import (                                        # noqa: E402
+    build_email_notification,
+    build_sms_notification,
+    severity_label,
+)
 
 PARAMS = ["temperature", "humidity", "pressure", "wind_speed", "rainfall"]
 PARAM_LABELS = {
@@ -151,6 +156,8 @@ def init_state():
         )
     if "anomaly_log" not in st.session_state:
         st.session_state.anomaly_log = []
+    if "notification_log" not in st.session_state:
+        st.session_state.notification_log = []
     if "auto_run" not in st.session_state:
         st.session_state.auto_run = False
     if "warmed_up" not in st.session_state:
@@ -186,6 +193,32 @@ def process_reading(detector: AnomalyDetector, reading: dict) -> AnomalyResult:
             }
         )
         st.session_state.anomaly_log = st.session_state.anomaly_log[-100:]
+
+        # --- Alert Engine: build the notification that WOULD be sent ---
+        param_label = PARAM_LABELS.get(result.suspicious_param, "Unknown") if result.suspicious_param else "Unknown"
+        value_display = (
+            f"{format_value(result.suspicious_param, reading[result.suspicious_param])} "
+            f"{SensorSimulator.units()[result.suspicious_param]}"
+        ) if result.suspicious_param else "-"
+
+        email = build_email_notification(
+            parameter=result.suspicious_param,
+            parameter_label=param_label,
+            value_display=value_display,
+            anomaly_score=result.anomaly_score,
+            explanation=result.explanation,
+            detected_at=reading["timestamp"],
+            is_multi_parameter=result.is_multi_parameter,
+        )
+        sms = build_sms_notification(
+            parameter_label=param_label,
+            anomaly_score=result.anomaly_score,
+            is_multi_parameter=result.is_multi_parameter,
+        )
+        st.session_state.notification_log.append(
+            {"time": reading["timestamp"], "email": email, "sms": sms}
+        )
+        st.session_state.notification_log = st.session_state.notification_log[-50:]
 
     return result
 
@@ -401,6 +434,51 @@ with tab_dashboard:
                 status_text = "Requires Verification" if latest["is_multi_parameter"] else "Suspicious Reading"
                 st.error(f"**Status:** {status_text}\n\n{latest['explanation']}")
 
+            # --------------------------------------------------------
+            # Alert Engine — simulated notification preview
+            # --------------------------------------------------------
+            if st.session_state.notification_log:
+                latest_notif = st.session_state.notification_log[-1]
+                sev = latest_notif["email"]["severity"]
+                st.markdown("**📤 Alert Engine — Notification Sent**")
+                st.caption(
+                    "Prototype notice: no real email/SMS is sent — this shows "
+                    "what the Alert Engine would dispatch to a field "
+                    "technician in a production deployment."
+                )
+                tab_email, tab_sms = st.tabs(["📧 Email Preview", "📱 SMS Preview"])
+                with tab_email:
+                    em = latest_notif["email"]
+                    st.markdown(
+                        f"""
+                        <div style="border:1px solid #e2e8f0;border-radius:8px;
+                        padding:14px 16px;background-color:#ffffff;">
+                            <div style="color:#64748b;font-size:0.85rem;">To: {em['to']}</div>
+                            <div style="font-weight:700;color:#0f172a;margin:4px 0;">
+                                {em['subject']}
+                                <span class="status-badge" style="background-color:{sev['color']};
+                                margin-left:8px;">{sev['emoji']} {sev['label']}</span>
+                            </div>
+                            <pre style="white-space:pre-wrap;font-family:inherit;
+                            color:#334155;font-size:0.9rem;margin:0;">{em['body']}</pre>
+                        </div>
+                        """,
+                        unsafe_allow_html=True,
+                    )
+                with tab_sms:
+                    sm = latest_notif["sms"]
+                    st.markdown(
+                        f"""
+                        <div style="border:1px solid #e2e8f0;border-radius:8px;
+                        padding:14px 16px;background-color:#ffffff;max-width:340px;">
+                            <div style="color:#64748b;font-size:0.85rem;">To: {sm['to']}</div>
+                            <div style="background-color:#f1f5f9;border-radius:8px;
+                            padding:10px 12px;margin-top:6px;color:#0f172a;">{sm['text']}</div>
+                        </div>
+                        """,
+                        unsafe_allow_html=True,
+                    )
+
         # ------------------------------------------------------------
         # Anomaly history table
         # ------------------------------------------------------------
@@ -410,6 +488,15 @@ with tab_dashboard:
             st.dataframe(table, use_container_width=True, hide_index=True)
         else:
             st.caption("No anomalies logged yet. Use the sidebar to inject one.")
+
+        if st.session_state.notification_log:
+            with st.expander(f"📤 Notification Log ({len(st.session_state.notification_log)} alerts sent)"):
+                for n in reversed(st.session_state.notification_log[-20:]):
+                    sev = n["email"]["severity"]
+                    st.markdown(
+                        f"{sev['emoji']} **{n['time'].strftime('%H:%M:%S')}** — "
+                        f"{n['email']['subject']} *(email + SMS)*"
+                    )
 
 # ===========================================================================
 # TAB 2 — SYSTEM ARCHITECTURE
