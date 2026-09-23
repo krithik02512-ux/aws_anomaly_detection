@@ -189,12 +189,13 @@ def get_station_state(station_id: str) -> dict:
             "history": pd.DataFrame(
                 columns=["timestamp"] + PARAMS + ["is_anomaly", "anomaly_score",
                                                    "suspicious_param", "explanation",
-                                                   "is_multi_parameter"]
+                                                   "is_multi_parameter", "anomaly_id"]
             ),
             "anomaly_log": [],
             "notification_log": [],
             "auto_run": False,
             "warmed_up": False,
+            "anomaly_id_counter": 0,
         }
     return st.session_state.stations[station_id]
 
@@ -205,6 +206,11 @@ def process_reading(detector: AnomalyDetector, station: dict, reading: dict) -> 
     features = {p: reading[p] for p in PARAMS}
     result = detector.analyze(features)
 
+    anomaly_id = None
+    if result.is_anomaly:
+        anomaly_id = station["anomaly_id_counter"]
+        station["anomaly_id_counter"] += 1
+
     row = {
         "timestamp": reading["timestamp"],
         **features,
@@ -213,6 +219,7 @@ def process_reading(detector: AnomalyDetector, station: dict, reading: dict) -> 
         "suspicious_param": result.suspicious_param,
         "explanation": result.explanation,
         "is_multi_parameter": result.is_multi_parameter,
+        "anomaly_id": anomaly_id,
     }
     station["history"] = pd.concat(
         [station["history"], pd.DataFrame([row])], ignore_index=True
@@ -221,11 +228,15 @@ def process_reading(detector: AnomalyDetector, station: dict, reading: dict) -> 
     if result.is_anomaly:
         station["anomaly_log"].append(
             {
+                "id": anomaly_id,
                 "time": reading["timestamp"],
                 "parameter": PARAM_LABELS.get(result.suspicious_param, "Multiple") if not result.is_multi_parameter else "Multiple",
                 "value": format_value(result.suspicious_param, reading[result.suspicious_param]) if result.suspicious_param else "-",
                 "score": result.anomaly_score,
                 "status": "Multi-parameter" if result.is_multi_parameter else "Anomaly",
+                # Human-in-the-loop verification: "Unverified" until a
+                # technician clicks Confirm Fault / False Alarm below.
+                "verification": "Unverified",
             }
         )
         station["anomaly_log"] = station["anomaly_log"][-100:]
@@ -257,6 +268,33 @@ def process_reading(detector: AnomalyDetector, station: dict, reading: dict) -> 
         station["notification_log"] = station["notification_log"][-50:]
 
     return result
+
+
+def find_anomaly_entry(station: dict, anomaly_id):
+    """Looks up one anomaly_log entry by its unique id."""
+    if anomaly_id is None:
+        return None
+    for entry in station["anomaly_log"]:
+        if entry.get("id") == anomaly_id:
+            return entry
+    return None
+
+
+def verification_summary(anomaly_log: list) -> dict:
+    """Confirmed / false-alarm / pending counts, plus a human-verified
+    accuracy rate, across all logged anomalies for a station."""
+    confirmed = sum(1 for e in anomaly_log if e.get("verification") == "Confirmed Fault")
+    false_alarm = sum(1 for e in anomaly_log if e.get("verification") == "False Alarm")
+    pending = sum(1 for e in anomaly_log if e.get("verification") == "Unverified")
+    verified_total = confirmed + false_alarm
+    accuracy = (confirmed / verified_total * 100) if verified_total else None
+    return {
+        "confirmed": confirmed,
+        "false_alarm": false_alarm,
+        "pending": pending,
+        "verified_total": verified_total,
+        "accuracy": accuracy,
+    }
 
 
 init_state()
@@ -532,6 +570,32 @@ def render_live_dashboard():
                 "reported as the likely cause."
             )
 
+            # ----------------------------------------------------
+            # Human-in-the-loop verification for THIS anomaly
+            # ----------------------------------------------------
+            entry = find_anomaly_entry(station, latest["anomaly_id"])
+            if entry is not None:
+                st.markdown("**🧑‍🔧 Technician Verification**")
+                if entry["verification"] == "Unverified":
+                    vcol1, vcol2, vcol3 = st.columns([1, 1, 2])
+                    with vcol1:
+                        if st.button("✅ Confirm Fault", key=f"confirm_{entry['id']}",
+                                     use_container_width=True):
+                            entry["verification"] = "Confirmed Fault"
+                            st.rerun(scope="fragment")
+                    with vcol2:
+                        if st.button("❌ False Alarm", key=f"false_{entry['id']}",
+                                     use_container_width=True):
+                            entry["verification"] = "False Alarm"
+                            st.rerun(scope="fragment")
+                    with vcol3:
+                        st.caption("Mark whether this was a real sensor fault or a false alarm — "
+                                   "builds a live accuracy record for the model.")
+                elif entry["verification"] == "Confirmed Fault":
+                    st.success("✅ Verified by technician: **Confirmed Fault**")
+                else:
+                    st.warning("❌ Verified by technician: **False Alarm**")
+
         # --------------------------------------------------------
         # Alert Engine — simulated notification preview
         # --------------------------------------------------------
@@ -578,12 +642,66 @@ def render_live_dashboard():
                 )
 
     # ------------------------------------------------------------
-    # Anomaly history table
+    # Anomaly history table + human-verification accuracy + CSV export
     # ------------------------------------------------------------
     st.subheader("🗂️ Anomaly History")
-    table = history_to_display_table(station["anomaly_log"])
-    if len(table):
-        st.dataframe(table, use_container_width=True, hide_index=True)
+
+    if station["anomaly_log"]:
+        vs = verification_summary(station["anomaly_log"])
+        vcol1, vcol2, vcol3, vcol4 = st.columns(4)
+        vcol1.metric("✅ Confirmed Faults", vs["confirmed"])
+        vcol2.metric("❌ False Alarms", vs["false_alarm"])
+        vcol3.metric("⏳ Pending Review", vs["pending"])
+        vcol4.metric(
+            "Verified Accuracy",
+            f"{vs['accuracy']:.0f}%" if vs["accuracy"] is not None else "—",
+            help="Of the anomalies a technician has reviewed so far, the share "
+                 "confirmed as a real fault rather than a false alarm.",
+        )
+
+        verification_emoji = {
+            "Unverified": "⏳ Unverified",
+            "Confirmed Fault": "✅ Confirmed Fault",
+            "False Alarm": "❌ False Alarm",
+        }
+        display_rows = [
+            {
+                "Time": e["time"].strftime("%H:%M:%S"),
+                "Parameter": e["parameter"],
+                "Value": e["value"],
+                "Anomaly Score": e["score"],
+                "Status": e["status"],
+                "Verification": verification_emoji.get(e["verification"], e["verification"]),
+            }
+            for e in reversed(station["anomaly_log"])
+        ]
+        display_df = pd.DataFrame(display_rows)
+        st.dataframe(display_df, use_container_width=True, hide_index=True)
+
+        # --- CSV export ---
+        export_df = pd.DataFrame(
+            [
+                {
+                    "station": STATION_LABELS[st.session_state.selected_station],
+                    "time": e["time"].strftime("%Y-%m-%d %H:%M:%S"),
+                    "parameter": e["parameter"],
+                    "value": e["value"],
+                    "anomaly_score": e["score"],
+                    "status": e["status"],
+                    "verification": e["verification"],
+                }
+                for e in station["anomaly_log"]
+            ]
+        )
+        csv_bytes = export_df.to_csv(index=False).encode("utf-8")
+        timestamp_str = datetime.now().strftime("%Y%m%d_%H%M%S")
+        st.download_button(
+            "⬇️ Export Anomaly History (CSV)",
+            data=csv_bytes,
+            file_name=f"{st.session_state.selected_station}_anomaly_history_{timestamp_str}.csv",
+            mime="text/csv",
+            use_container_width=True,
+        )
     else:
         st.caption("No anomalies logged yet. Use the sidebar to inject one.")
 
