@@ -208,7 +208,9 @@ if not st.session_state.warmed_up:
 st.title("🛰️ AI-Powered Automatic Weather Station Monitoring")
 st.caption("Intelligent Multi-Sensor Anomaly Detection")
 
-tab_dashboard, tab_architecture = st.tabs(["📊 Live Dashboard", "🏗️ System Architecture"])
+tab_dashboard, tab_architecture, tab_metrics = st.tabs(
+    ["📊 Live Dashboard", "🏗️ System Architecture", "📐 Model Performance"]
+)
 
 # ===========================================================================
 # SIDEBAR — Simulation Controls
@@ -479,6 +481,116 @@ a technician straight at the sensor most likely responsible.
         """
     )
 
+# ===========================================================================
+# TAB 3 — MODEL PERFORMANCE
+# ===========================================================================
+with tab_metrics:
+    st.subheader("📐 Model Performance")
+    eval_path = os.path.join(BASE_DIR, "ml", "eval_results.json")
+
+    if not os.path.exists(eval_path):
+        st.warning(
+            "No evaluation results found. Run `python ml/evaluate_model.py` "
+            "from the project root, then refresh this page."
+        )
+    else:
+        import json
+        with open(eval_path) as f:
+            ev = json.load(f)
+
+        st.caption(
+            f"Evaluated on a held-out synthetic test set of "
+            f"**{ev['test_set_size']} readings** "
+            f"({ev['normal_count']} normal, {ev['anomalous_count']} labelled "
+            f"anomalous) — generated with a different random seed than the "
+            f"training data, so the model never saw these exact readings."
+        )
+
+        m = ev["metrics"]
+        c1, c2, c3, c4 = st.columns(4)
+        c1.metric("Precision", f"{m['precision']*100:.1f}%",
+                   help="Of readings flagged as anomalies, how many actually were.")
+        c2.metric("Recall", f"{m['recall']*100:.1f}%",
+                   help="Of all true anomalies, how many the system caught.")
+        c3.metric("F1 Score", f"{m['f1_score']*100:.1f}%",
+                   help="Balance between precision and recall.")
+        c4.metric("Accuracy", f"{m['accuracy']*100:.1f}%",
+                   help="Overall correct classification rate.")
+
+        st.write("")
+        col_a, col_b = st.columns([1, 1])
+
+        with col_a:
+            st.markdown("**Confusion Matrix**")
+            cm = ev["confusion_matrix"]
+            cm_fig = go.Figure(data=go.Heatmap(
+                z=[[cm["tn"], cm["fp"]], [cm["fn"], cm["tp"]]],
+                x=["Predicted Normal", "Predicted Anomaly"],
+                y=["Actual Normal", "Actual Anomaly"],
+                text=[[cm["tn"], cm["fp"]], [cm["fn"], cm["tp"]]],
+                texttemplate="%{text}",
+                textfont={"size": 18},
+                colorscale=[[0, "#dbeafe"], [1, "#2563eb"]],
+                showscale=False,
+            ))
+            cm_fig.update_layout(height=320, margin=dict(t=10, b=10, l=10, r=10))
+            st.plotly_chart(cm_fig, use_container_width=True)
+
+        with col_b:
+            st.markdown("**Anomaly Score Distribution**")
+            sd = ev["score_distribution"]
+            hist_fig = go.Figure()
+            hist_fig.add_trace(go.Histogram(
+                x=sd["normal"]["values"], name="Normal readings",
+                marker_color="#16a34a", opacity=0.7, nbinsx=20,
+            ))
+            hist_fig.add_trace(go.Histogram(
+                x=sd["anomalous"]["values"], name="Anomalous readings",
+                marker_color="#dc2626", opacity=0.7, nbinsx=20,
+            ))
+            hist_fig.update_layout(
+                barmode="overlay", height=320,
+                margin=dict(t=10, b=10, l=10, r=10),
+                xaxis_title="Anomaly Score (0-100)", yaxis_title="Count",
+                legend=dict(orientation="h", yanchor="bottom", y=1.02),
+            )
+            st.plotly_chart(hist_fig, use_container_width=True)
+
+        st.write("")
+        st.markdown("**Parameter Identification Accuracy**")
+        st.caption(
+            "When an anomaly was correctly detected, how often the system "
+            "pointed at the *right* sensor as the cause."
+        )
+        id_acc = ev["per_parameter_identification_accuracy"]
+        cols = st.columns(len(id_acc))
+        for col, (param, acc) in zip(cols, id_acc.items()):
+            col.metric(PARAM_LABELS.get(param, param), f"{acc*100:.0f}%" if acc is not None else "—")
+
+        st.write("")
+        with st.expander("Model configuration"):
+            info = ev["model_info"]
+            st.markdown(
+                f"""
+- **Algorithm:** {info['algorithm']}
+- **Trees (n_estimators):** {info['n_estimators']}
+- **Contamination setting:** {info['contamination']}
+- **Features used:** {', '.join(info['features_used'])}
+- **Training samples:** {info['training_samples']}
+                """
+            )
+        st.caption(
+            "To regenerate these results after retraining the model, run "
+            "`python ml/evaluate_model.py` from the project root."
+        )
+
+# ===========================================================================
+# LIVE AUTO-REFRESH LOOP
+# ===========================================================================
+# When the "Live auto-refresh" toggle is on, wait a couple of seconds and
+# then trigger a full script rerun, which (because auto_run is still True)
+# generates a fresh reading at the top of this same run. This is the
+# standard sleep + rerun pattern used for "live" updates in Streamlit.
 if st.session_state.auto_run:
     time.sleep(AUTO_REFRESH_SECONDS)
     st.rerun()
