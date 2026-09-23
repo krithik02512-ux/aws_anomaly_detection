@@ -10,39 +10,17 @@ Pipeline implemented on every reading:
     Alert Engine -> Dashboard
 
 Run with:  streamlit run app.py
-
-NOTE ON THE LIVE AUTO-REFRESH FIX
-----------------------------------
-Previously, "Live auto-refresh" was implemented with time.sleep(2) +
-st.rerun() at the very bottom of the script. st.rerun() reruns the ENTIRE
-script top-to-bottom, which tears down and rebuilds every element on the
-page (sidebar, header, tabs, everything) every 2 seconds — that full
-rebuild is what caused the visible white "blink"/flash.
-
-Fix: the live-updating part of the dashboard (Tab 1) is now wrapped in an
-@st.fragment. A fragment only reruns itself, not the whole app, so the
-periodic refresh happens quietly inside that one block instead of
-flashing the entire page. Requires streamlit>=1.37 (older versions:
-use st.experimental_fragment instead of st.fragment).
 """
 
 import os
 import sys
 import time
 from datetime import datetime
-from io import BytesIO
 
 import pandas as pd
 import plotly.graph_objects as go
 from plotly.subplots import make_subplots
 import streamlit as st
-from reportlab.lib.pagesizes import A4
-from reportlab.lib import colors
-from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
-from reportlab.lib.units import mm
-from reportlab.platypus import (
-    SimpleDocTemplate, Table, TableStyle, Paragraph, Spacer, HRFlowable
-)
 
 # ---------------------------------------------------------------------------
 # Make sure local packages (ml/, simulation/, utils/) are importable
@@ -197,13 +175,12 @@ def get_station_state(station_id: str) -> dict:
             "history": pd.DataFrame(
                 columns=["timestamp"] + PARAMS + ["is_anomaly", "anomaly_score",
                                                    "suspicious_param", "explanation",
-                                                   "is_multi_parameter", "anomaly_id"]
+                                                   "is_multi_parameter"]
             ),
             "anomaly_log": [],
             "notification_log": [],
             "auto_run": False,
             "warmed_up": False,
-            "anomaly_id_counter": 0,
         }
     return st.session_state.stations[station_id]
 
@@ -214,11 +191,6 @@ def process_reading(detector: AnomalyDetector, station: dict, reading: dict) -> 
     features = {p: reading[p] for p in PARAMS}
     result = detector.analyze(features)
 
-    anomaly_id = None
-    if result.is_anomaly:
-        anomaly_id = station["anomaly_id_counter"]
-        station["anomaly_id_counter"] += 1
-
     row = {
         "timestamp": reading["timestamp"],
         **features,
@@ -227,7 +199,6 @@ def process_reading(detector: AnomalyDetector, station: dict, reading: dict) -> 
         "suspicious_param": result.suspicious_param,
         "explanation": result.explanation,
         "is_multi_parameter": result.is_multi_parameter,
-        "anomaly_id": anomaly_id,
     }
     station["history"] = pd.concat(
         [station["history"], pd.DataFrame([row])], ignore_index=True
@@ -236,15 +207,11 @@ def process_reading(detector: AnomalyDetector, station: dict, reading: dict) -> 
     if result.is_anomaly:
         station["anomaly_log"].append(
             {
-                "id": anomaly_id,
                 "time": reading["timestamp"],
                 "parameter": PARAM_LABELS.get(result.suspicious_param, "Multiple") if not result.is_multi_parameter else "Multiple",
                 "value": format_value(result.suspicious_param, reading[result.suspicious_param]) if result.suspicious_param else "-",
                 "score": result.anomaly_score,
                 "status": "Multi-parameter" if result.is_multi_parameter else "Anomaly",
-                # Human-in-the-loop verification: "Unverified" until a
-                # technician clicks Confirm Fault / False Alarm below.
-                "verification": "Unverified",
             }
         )
         station["anomaly_log"] = station["anomaly_log"][-100:]
@@ -276,124 +243,6 @@ def process_reading(detector: AnomalyDetector, station: dict, reading: dict) -> 
         station["notification_log"] = station["notification_log"][-50:]
 
     return result
-
-
-def find_anomaly_entry(station: dict, anomaly_id):
-    """Looks up one anomaly_log entry by its unique id."""
-    if anomaly_id is None:
-        return None
-    for entry in station["anomaly_log"]:
-        if entry.get("id") == anomaly_id:
-            return entry
-    return None
-
-
-def verification_summary(anomaly_log: list) -> dict:
-    """Confirmed / false-alarm / pending counts, plus a human-verified
-    accuracy rate, across all logged anomalies for a station."""
-    confirmed = sum(1 for e in anomaly_log if e.get("verification") == "Confirmed Fault")
-    false_alarm = sum(1 for e in anomaly_log if e.get("verification") == "False Alarm")
-    pending = sum(1 for e in anomaly_log if e.get("verification") == "Unverified")
-    verified_total = confirmed + false_alarm
-    accuracy = (confirmed / verified_total * 100) if verified_total else None
-    return {
-        "confirmed": confirmed,
-        "false_alarm": false_alarm,
-        "pending": pending,
-        "verified_total": verified_total,
-        "accuracy": accuracy,
-    }
-
-
-def generate_incident_report_pdf(station_label: str, entry: dict, row, contribution: dict,
-                                  param_labels: dict) -> bytes:
-    """Builds a one-page PDF incident report for a single anomaly: summary,
-    explanation, sensor-contribution breakdown, and technician verification
-    status — suitable to hand to a field team or attach to a logbook."""
-    buffer = BytesIO()
-    doc = SimpleDocTemplate(buffer, pagesize=A4, topMargin=20 * mm, bottomMargin=20 * mm,
-                             leftMargin=20 * mm, rightMargin=20 * mm)
-    styles = getSampleStyleSheet()
-    title_style = ParagraphStyle("ReportTitle", parent=styles["Title"], fontSize=18,
-                                  textColor=colors.HexColor("#0f172a"))
-    heading_style = ParagraphStyle("ReportHeading", parent=styles["Heading2"], fontSize=13,
-                                    textColor=colors.HexColor("#1e293b"), spaceBefore=6)
-    normal_style = styles["Normal"]
-    footer_style = ParagraphStyle("ReportFooter", parent=normal_style, fontSize=8,
-                                   textColor=colors.HexColor("#94a3b8"))
-
-    verification_display = {
-        "Unverified": "⏳ Pending technician review",
-        "Confirmed Fault": "✅ Confirmed Fault",
-        "False Alarm": "❌ False Alarm",
-    }.get(entry["verification"], entry["verification"])
-
-    elems = [
-        Paragraph("AWS Anomaly Incident Report", title_style),
-        Spacer(1, 3 * mm),
-        Paragraph(f"Station: <b>{station_label}</b>", normal_style),
-        Paragraph(f"Detected at: <b>{entry['time'].strftime('%Y-%m-%d %H:%M:%S')}</b>", normal_style),
-        Paragraph(f"Report generated: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}", normal_style),
-        Spacer(1, 5 * mm),
-        HRFlowable(width="100%", color=colors.HexColor("#cbd5e1")),
-        Spacer(1, 5 * mm),
-        Paragraph("Summary", heading_style),
-    ]
-
-    summary_table = Table(
-        [
-            ["Parameter", entry["parameter"]],
-            ["Value", str(entry["value"])],
-            ["Anomaly Score", f"{entry['score']:.1f} / 100"],
-            ["Status", entry["status"]],
-            ["Technician Verification", verification_display],
-        ],
-        colWidths=[55 * mm, 100 * mm],
-    )
-    summary_table.setStyle(TableStyle([
-        ("BACKGROUND", (0, 0), (0, -1), colors.HexColor("#f1f5f9")),
-        ("TEXTCOLOR", (0, 0), (-1, -1), colors.HexColor("#0f172a")),
-        ("FONTSIZE", (0, 0), (-1, -1), 10),
-        ("GRID", (0, 0), (-1, -1), 0.5, colors.HexColor("#e2e8f0")),
-        ("VALIGN", (0, 0), (-1, -1), "MIDDLE"),
-        ("TOPPADDING", (0, 0), (-1, -1), 6),
-        ("BOTTOMPADDING", (0, 0), (-1, -1), 6),
-    ]))
-    elems.append(summary_table)
-    elems.append(Spacer(1, 7 * mm))
-
-    elems.append(Paragraph("System Explanation", heading_style))
-    elems.append(Paragraph(row.get("explanation", "-") or "-", normal_style))
-    elems.append(Spacer(1, 7 * mm))
-
-    elems.append(Paragraph("Sensor Contribution Analysis", heading_style))
-    contrib_rows = [["Sensor", "Contribution to anomaly"]]
-    for p, pct in sorted(contribution.items(), key=lambda kv: -kv[1]):
-        contrib_rows.append([param_labels.get(p, p), f"{pct:.1f}%"])
-    contrib_table = Table(contrib_rows, colWidths=[75 * mm, 80 * mm])
-    contrib_table.setStyle(TableStyle([
-        ("BACKGROUND", (0, 0), (-1, 0), colors.HexColor("#0f172a")),
-        ("TEXTCOLOR", (0, 0), (-1, 0), colors.white),
-        ("FONTSIZE", (0, 0), (-1, -1), 10),
-        ("GRID", (0, 0), (-1, -1), 0.5, colors.HexColor("#e2e8f0")),
-        ("ROWBACKGROUNDS", (0, 1), (-1, -1), [colors.white, colors.HexColor("#f8fafc")]),
-        ("TOPPADDING", (0, 0), (-1, -1), 5),
-        ("BOTTOMPADDING", (0, 0), (-1, -1), 5),
-    ]))
-    elems.append(contrib_table)
-    elems.append(Spacer(1, 10 * mm))
-    elems.append(HRFlowable(width="100%", color=colors.HexColor("#cbd5e1")))
-    elems.append(Spacer(1, 4 * mm))
-    elems.append(Paragraph(
-        "Prototype notice: generated from simulated/synthetic AWS sensor data as part of "
-        "a college engineering demonstration. Not a certified meteorological or "
-        "safety-critical report.",
-        footer_style,
-    ))
-
-    doc.build(elems)
-    buffer.seek(0)
-    return buffer.getvalue()
 
 
 init_state()
@@ -478,12 +327,8 @@ with st.sidebar:
     )
 
 # ---------------------------------------------------------------------------
-# Handle control actions triggered from the sidebar (manual generate /
-# inject / reset). These are user-initiated, one-off, full-page reruns —
-# that's normal Streamlit behaviour and not what caused the blinking.
-# The periodic auto-refresh reading (every AUTO_REFRESH_SECONDS while the
-# toggle is on) is now generated INSIDE the fragment below instead, so it
-# no longer triggers a full-page rerun.
+# Handle control actions (each triggers exactly one new reading, except
+# auto-run which generates one per refresh cycle below)
 # ---------------------------------------------------------------------------
 reading_triggered = manual_generate
 
@@ -499,339 +344,234 @@ if reading_triggered:
     r = sim.generate_reading()
     process_reading(detector, station, r)
 
-# ===========================================================================
-# TAB 1 — LIVE DASHBOARD (fragment-scoped so periodic auto-refresh only
-# repaints this block, not the whole page — this is the flicker fix)
-# ===========================================================================
-@st.fragment(run_every=AUTO_REFRESH_SECONDS if station["auto_run"] else None)
-def render_live_dashboard():
-    # Generate the periodic reading for live auto-refresh here, inside the
-    # fragment, instead of via a full-page time.sleep()+st.rerun() loop.
-    if station["auto_run"]:
-        r = sim.generate_reading()
-        process_reading(detector, station, r)
+if station["auto_run"]:
+    r = sim.generate_reading()
+    process_reading(detector, station, r)
 
-    history: pd.DataFrame = station["history"]
-    latest = history.iloc[-1] if len(history) else None
+history: pd.DataFrame = station["history"]
+latest = history.iloc[-1] if len(history) else None
 
+# ===========================================================================
+# TAB 1 — LIVE DASHBOARD
+# ===========================================================================
+with tab_dashboard:
     if latest is None:
         st.info("Click **Generate Next Reading** in the sidebar to start the simulation.")
-        return
-
-    # ------------------------------------------------------------
-    # System status banner
-    # ------------------------------------------------------------
-    if latest["is_anomaly"]:
-        banner_color = "#fee2e2"
-        banner_text_color = "#991b1b"
-        label = "🔴 ANOMALY DETECTED"
     else:
-        banner_color = "#dcfce7"
-        banner_text_color = "#166534"
-        label = "🟢 SYSTEM NORMAL"
+        # ------------------------------------------------------------
+        # System status banner
+        # ------------------------------------------------------------
+        if latest["is_anomaly"]:
+            banner_color = "#fee2e2"
+            banner_text_color = "#991b1b"
+            label = "🔴 ANOMALY DETECTED"
+        else:
+            banner_color = "#dcfce7"
+            banner_text_color = "#166534"
+            label = "🟢 SYSTEM NORMAL"
 
-    st.markdown(
-        f"""<div class="system-banner" style="background-color:{banner_color};
-        color:{banner_text_color};">{label}
-        &nbsp;&nbsp;|&nbsp;&nbsp; Anomaly Score: {latest['anomaly_score']:.1f} / 100</div>""",
-        unsafe_allow_html=True,
-    )
-
-    # ------------------------------------------------------------
-    # Sensor cards
-    # ------------------------------------------------------------
-    cols = st.columns(5)
-    for i, param in enumerate(PARAMS):
-        value = latest[param]
-        z = detector.feature_stats[param]
-        z_score = (value - z["mean"]) / (z["std"] if z["std"] > 1e-6 else 1e-6)
-        status = param_status(
-            param,
-            latest["suspicious_param"],
-            latest["is_anomaly"],
-            z_score,
+        st.markdown(
+            f"""<div class="system-banner" style="background-color:{banner_color};
+            color:{banner_text_color};">{label}
+            &nbsp;&nbsp;|&nbsp;&nbsp; Anomaly Score: {latest['anomaly_score']:.1f} / 100</div>""",
+            unsafe_allow_html=True,
         )
-        trend = compute_trend(history, param)
-        unit = SensorSimulator.units()[param]
 
-        with cols[i]:
-            st.markdown(
-                f"""
-                <div class="metric-card">
-                    <h4>{PARAM_LABELS[param]}</h4>
-                    <p class="metric-value">{format_value(param, value)}
-                        <span class="metric-unit">{unit} {trend_arrow(trend)}</span>
-                    </p>
-                    <span class="status-badge" style="background-color:{STATUS_COLORS[status]};">
-                        {STATUS_LABELS[status]}
-                    </span>
-                </div>
-                """,
-                unsafe_allow_html=True,
+        # ------------------------------------------------------------
+        # Sensor cards
+        # ------------------------------------------------------------
+        cols = st.columns(5)
+        for i, param in enumerate(PARAMS):
+            value = latest[param]
+            z = detector.feature_stats[param]
+            z_score = (value - z["mean"]) / (z["std"] if z["std"] > 1e-6 else 1e-6)
+            status = param_status(
+                param,
+                latest["suspicious_param"],
+                latest["is_anomaly"],
+                z_score,
             )
+            trend = compute_trend(history, param)
+            unit = SensorSimulator.units()[param]
 
-    st.write("")
+            with cols[i]:
+                st.markdown(
+                    f"""
+                    <div class="metric-card">
+                        <h4>{PARAM_LABELS[param]}</h4>
+                        <p class="metric-value">{format_value(param, value)}
+                            <span class="metric-unit">{unit} {trend_arrow(trend)}</span>
+                        </p>
+                        <span class="status-badge" style="background-color:{STATUS_COLORS[status]};">
+                            {STATUS_LABELS[status]}
+                        </span>
+                    </div>
+                    """,
+                    unsafe_allow_html=True,
+                )
 
-    # ------------------------------------------------------------
-    # Live graphs
-    # ------------------------------------------------------------
-    st.subheader("📈 Live Sensor Trends")
-    plot_df = history.tail(60).copy()
+        st.write("")
 
-    fig = make_subplots(
-        rows=2, cols=3,
-        subplot_titles=[PARAM_LABELS[p] for p in PARAMS] + [""],
-        vertical_spacing=0.12,
-    )
-    positions = [(1, 1), (1, 2), (1, 3), (2, 1), (2, 2)]
-    for param, (row, col) in zip(PARAMS, positions):
-        fig.add_trace(
-            go.Scatter(
-                x=plot_df["timestamp"], y=plot_df[param],
-                mode="lines", name=PARAM_LABELS[param],
-                line=dict(color="#2563eb", width=2),
-                showlegend=False,
-            ),
-            row=row, col=col,
+        # ------------------------------------------------------------
+        # Live graphs
+        # ------------------------------------------------------------
+        st.subheader("📈 Live Sensor Trends")
+        plot_df = history.tail(60).copy()
+
+        fig = make_subplots(
+            rows=2, cols=3,
+            subplot_titles=[PARAM_LABELS[p] for p in PARAMS] + [""],
+            vertical_spacing=0.12,
         )
-        anomalous_pts = plot_df[
-            plot_df["is_anomaly"] & (plot_df["suspicious_param"] == param)
-        ]
-        if len(anomalous_pts):
+        positions = [(1, 1), (1, 2), (1, 3), (2, 1), (2, 2)]
+        for param, (row, col) in zip(PARAMS, positions):
             fig.add_trace(
                 go.Scatter(
-                    x=anomalous_pts["timestamp"], y=anomalous_pts[param],
-                    mode="markers", name="Anomaly",
-                    marker=dict(color="#dc2626", size=9, symbol="circle"),
+                    x=plot_df["timestamp"], y=plot_df[param],
+                    mode="lines", name=PARAM_LABELS[param],
+                    line=dict(color="#2563eb", width=2),
                     showlegend=False,
                 ),
                 row=row, col=col,
             )
-    fig.update_layout(height=480, margin=dict(t=40, b=20, l=20, r=20))
-    st.plotly_chart(fig, use_container_width=True)
-
-    # ------------------------------------------------------------
-    # Anomaly alert panel
-    # ------------------------------------------------------------
-    if latest["is_anomaly"]:
-        st.subheader("🚨 Anomaly Alert")
-        with st.container(border=True):
-            c1, c2, c3, c4 = st.columns(4)
-            c1.metric("Detection Time", latest["timestamp"].strftime("%H:%M:%S"))
-            param_display = (
-                "Multiple parameters" if latest["is_multi_parameter"]
-                else PARAM_LABELS.get(latest["suspicious_param"], "-")
-            )
-            c2.metric("Parameter", param_display)
-            if latest["suspicious_param"]:
-                c3.metric(
-                    "Current Value",
-                    f"{format_value(latest['suspicious_param'], latest[latest['suspicious_param']])} "
-                    f"{SensorSimulator.units()[latest['suspicious_param']]}",
-                )
-            c4.metric("Anomaly Score", f"{latest['anomaly_score']:.1f}")
-            status_text = "Requires Verification" if latest["is_multi_parameter"] else "Suspicious Reading"
-            st.error(f"**Status:** {status_text}\n\n{latest['explanation']}")
-
-            # ----------------------------------------------------
-            # Feature Importance — which sensor drove this anomaly
-            # ----------------------------------------------------
-            st.markdown("**🔍 Sensor Contribution to This Anomaly**")
-            z_scores = {}
-            for p in PARAMS:
-                stats = detector.feature_stats[p]
-                std = stats["std"] if stats["std"] > 1e-6 else 1e-6
-                z_scores[p] = abs((latest[p] - stats["mean"]) / std)
-            total_z = sum(z_scores.values()) or 1e-6
-            contribution = {p: (z / total_z) * 100 for p, z in z_scores.items()}
-            sorted_params = sorted(contribution, key=lambda p: contribution[p], reverse=True)
-
-            fi_fig = go.Figure(go.Bar(
-                x=[contribution[p] for p in sorted_params],
-                y=[PARAM_LABELS[p] for p in sorted_params],
-                orientation="h",
-                text=[f"{contribution[p]:.0f}%" for p in sorted_params],
-                textposition="outside",
-                marker_color=[
-                    "#dc2626" if p == latest["suspicious_param"] else "#93c5fd"
-                    for p in sorted_params
-                ],
-            ))
-            fi_fig.update_layout(
-                height=220, margin=dict(t=10, b=10, l=10, r=30),
-                xaxis_title="Contribution to anomaly (%)",
-                xaxis=dict(range=[0, max(contribution.values()) * 1.25]),
-            )
-            st.plotly_chart(fi_fig, use_container_width=True)
-            st.caption(
-                "Based on how many standard deviations each sensor sits from its "
-                "own learned normal range — the sensor with the largest share is "
-                "reported as the likely cause."
-            )
-
-            # ----------------------------------------------------
-            # Human-in-the-loop verification for THIS anomaly
-            # ----------------------------------------------------
-            entry = find_anomaly_entry(station, latest["anomaly_id"])
-            if entry is not None:
-                st.markdown("**🧑‍🔧 Technician Verification**")
-                if entry["verification"] == "Unverified":
-                    vcol1, vcol2, vcol3 = st.columns([1, 1, 2])
-                    with vcol1:
-                        if st.button("✅ Confirm Fault", key=f"confirm_{entry['id']}",
-                                     use_container_width=True):
-                            entry["verification"] = "Confirmed Fault"
-                            st.rerun(scope="fragment")
-                    with vcol2:
-                        if st.button("❌ False Alarm", key=f"false_{entry['id']}",
-                                     use_container_width=True):
-                            entry["verification"] = "False Alarm"
-                            st.rerun(scope="fragment")
-                    with vcol3:
-                        st.caption("Mark whether this was a real sensor fault or a false alarm — "
-                                   "builds a live accuracy record for the model.")
-                elif entry["verification"] == "Confirmed Fault":
-                    st.success("✅ Verified by technician: **Confirmed Fault**")
-                else:
-                    st.warning("❌ Verified by technician: **False Alarm**")
-
-                pdf_bytes = generate_incident_report_pdf(
-                    STATION_LABELS[st.session_state.selected_station],
-                    entry, latest, contribution, PARAM_LABELS,
-                )
-                st.download_button(
-                    "📄 Download Incident Report (PDF)",
-                    data=pdf_bytes,
-                    file_name=(
-                        f"{st.session_state.selected_station}_incident_{entry['id']}_"
-                        f"{latest['timestamp'].strftime('%Y%m%d_%H%M%S')}.pdf"
-                    ),
-                    mime="application/pdf",
-                    use_container_width=True,
-                    key=f"pdf_{entry['id']}",
-                )
-
-        # --------------------------------------------------------
-        # Alert Engine — simulated notification preview
-        # --------------------------------------------------------
-        if station["notification_log"]:
-            latest_notif = station["notification_log"][-1]
-            sev = latest_notif["email"]["severity"]
-            st.markdown("**📤 Alert Engine — Notification Sent**")
-            st.caption(
-                "Prototype notice: no real email/SMS is sent — this shows "
-                "what the Alert Engine would dispatch to a field "
-                "technician in a production deployment."
-            )
-            tab_email, tab_sms = st.tabs(["📧 Email Preview", "📱 SMS Preview"])
-            with tab_email:
-                em = latest_notif["email"]
-                st.markdown(
-                    f"""
-                    <div style="border:1px solid #e2e8f0;border-radius:8px;
-                    padding:14px 16px;background-color:#ffffff;">
-                        <div style="color:#64748b;font-size:0.85rem;">To: {em['to']}</div>
-                        <div style="font-weight:700;color:#0f172a;margin:4px 0;">
-                            {em['subject']}
-                            <span class="status-badge" style="background-color:{sev['color']};
-                            margin-left:8px;">{sev['emoji']} {sev['label']}</span>
-                        </div>
-                        <pre style="white-space:pre-wrap;font-family:inherit;
-                        color:#334155;font-size:0.9rem;margin:0;">{em['body']}</pre>
-                    </div>
-                    """,
-                    unsafe_allow_html=True,
-                )
-            with tab_sms:
-                sm = latest_notif["sms"]
-                st.markdown(
-                    f"""
-                    <div style="border:1px solid #e2e8f0;border-radius:8px;
-                    padding:14px 16px;background-color:#ffffff;max-width:340px;">
-                        <div style="color:#64748b;font-size:0.85rem;">To: {sm['to']}</div>
-                        <div style="background-color:#f1f5f9;border-radius:8px;
-                        padding:10px 12px;margin-top:6px;color:#0f172a;">{sm['text']}</div>
-                    </div>
-                    """,
-                    unsafe_allow_html=True,
-                )
-
-    # ------------------------------------------------------------
-    # Anomaly history table + human-verification accuracy + CSV export
-    # ------------------------------------------------------------
-    st.subheader("🗂️ Anomaly History")
-
-    if station["anomaly_log"]:
-        vs = verification_summary(station["anomaly_log"])
-        vcol1, vcol2, vcol3, vcol4 = st.columns(4)
-        vcol1.metric("✅ Confirmed Faults", vs["confirmed"])
-        vcol2.metric("❌ False Alarms", vs["false_alarm"])
-        vcol3.metric("⏳ Pending Review", vs["pending"])
-        vcol4.metric(
-            "Verified Accuracy",
-            f"{vs['accuracy']:.0f}%" if vs["accuracy"] is not None else "—",
-            help="Of the anomalies a technician has reviewed so far, the share "
-                 "confirmed as a real fault rather than a false alarm.",
-        )
-
-        verification_emoji = {
-            "Unverified": "⏳ Unverified",
-            "Confirmed Fault": "✅ Confirmed Fault",
-            "False Alarm": "❌ False Alarm",
-        }
-        display_rows = [
-            {
-                "Time": e["time"].strftime("%H:%M:%S"),
-                "Parameter": e["parameter"],
-                "Value": e["value"],
-                "Anomaly Score": e["score"],
-                "Status": e["status"],
-                "Verification": verification_emoji.get(e["verification"], e["verification"]),
-            }
-            for e in reversed(station["anomaly_log"])
-        ]
-        display_df = pd.DataFrame(display_rows)
-        st.dataframe(display_df, use_container_width=True, hide_index=True)
-
-        # --- CSV export ---
-        export_df = pd.DataFrame(
-            [
-                {
-                    "station": STATION_LABELS[st.session_state.selected_station],
-                    "time": e["time"].strftime("%Y-%m-%d %H:%M:%S"),
-                    "parameter": e["parameter"],
-                    "value": e["value"],
-                    "anomaly_score": e["score"],
-                    "status": e["status"],
-                    "verification": e["verification"],
-                }
-                for e in station["anomaly_log"]
+            anomalous_pts = plot_df[
+                plot_df["is_anomaly"] & (plot_df["suspicious_param"] == param)
             ]
-        )
-        csv_bytes = export_df.to_csv(index=False).encode("utf-8")
-        timestamp_str = datetime.now().strftime("%Y%m%d_%H%M%S")
-        st.download_button(
-            "⬇️ Export Anomaly History (CSV)",
-            data=csv_bytes,
-            file_name=f"{st.session_state.selected_station}_anomaly_history_{timestamp_str}.csv",
-            mime="text/csv",
-            use_container_width=True,
-        )
-    else:
-        st.caption("No anomalies logged yet. Use the sidebar to inject one.")
+            if len(anomalous_pts):
+                fig.add_trace(
+                    go.Scatter(
+                        x=anomalous_pts["timestamp"], y=anomalous_pts[param],
+                        mode="markers", name="Anomaly",
+                        marker=dict(color="#dc2626", size=9, symbol="circle"),
+                        showlegend=False,
+                    ),
+                    row=row, col=col,
+                )
+        fig.update_layout(height=480, margin=dict(t=40, b=20, l=20, r=20))
+        st.plotly_chart(fig, use_container_width=True)
 
-    if station["notification_log"]:
-        with st.expander(f"📤 Notification Log ({len(station['notification_log'])} alerts sent)"):
-            for n in reversed(station["notification_log"][-20:]):
-                sev = n["email"]["severity"]
-                st.markdown(
-                    f"{sev['emoji']} **{n['time'].strftime('%H:%M:%S')}** — "
-                    f"{n['email']['subject']} *(email + SMS)*"
+        # ------------------------------------------------------------
+        # Anomaly alert panel
+        # ------------------------------------------------------------
+        if latest["is_anomaly"]:
+            st.subheader("🚨 Anomaly Alert")
+            with st.container(border=True):
+                c1, c2, c3, c4 = st.columns(4)
+                c1.metric("Detection Time", latest["timestamp"].strftime("%H:%M:%S"))
+                param_display = (
+                    "Multiple parameters" if latest["is_multi_parameter"]
+                    else PARAM_LABELS.get(latest["suspicious_param"], "-")
+                )
+                c2.metric("Parameter", param_display)
+                if latest["suspicious_param"]:
+                    c3.metric(
+                        "Current Value",
+                        f"{format_value(latest['suspicious_param'], latest[latest['suspicious_param']])} "
+                        f"{SensorSimulator.units()[latest['suspicious_param']]}",
+                    )
+                c4.metric("Anomaly Score", f"{latest['anomaly_score']:.1f}")
+                status_text = "Requires Verification" if latest["is_multi_parameter"] else "Suspicious Reading"
+                st.error(f"**Status:** {status_text}\n\n{latest['explanation']}")
+
+                # ----------------------------------------------------
+                # Feature Importance — which sensor drove this anomaly
+                # ----------------------------------------------------
+                st.markdown("**🔍 Sensor Contribution to This Anomaly**")
+                z_scores = {}
+                for p in PARAMS:
+                    stats = detector.feature_stats[p]
+                    std = stats["std"] if stats["std"] > 1e-6 else 1e-6
+                    z_scores[p] = abs((latest[p] - stats["mean"]) / std)
+                total_z = sum(z_scores.values()) or 1e-6
+                contribution = {p: (z / total_z) * 100 for p, z in z_scores.items()}
+                sorted_params = sorted(contribution, key=lambda p: contribution[p], reverse=True)
+
+                fi_fig = go.Figure(go.Bar(
+                    x=[contribution[p] for p in sorted_params],
+                    y=[PARAM_LABELS[p] for p in sorted_params],
+                    orientation="h",
+                    text=[f"{contribution[p]:.0f}%" for p in sorted_params],
+                    textposition="outside",
+                    marker_color=[
+                        "#dc2626" if p == latest["suspicious_param"] else "#93c5fd"
+                        for p in sorted_params
+                    ],
+                ))
+                fi_fig.update_layout(
+                    height=220, margin=dict(t=10, b=10, l=10, r=30),
+                    xaxis_title="Contribution to anomaly (%)",
+                    xaxis=dict(range=[0, max(contribution.values()) * 1.25]),
+                )
+                st.plotly_chart(fi_fig, use_container_width=True)
+                st.caption(
+                    "Based on how many standard deviations each sensor sits from its "
+                    "own learned normal range — the sensor with the largest share is "
+                    "reported as the likely cause."
                 )
 
+            # --------------------------------------------------------
+            # Alert Engine — simulated notification preview
+            # --------------------------------------------------------
+            if station["notification_log"]:
+                latest_notif = station["notification_log"][-1]
+                sev = latest_notif["email"]["severity"]
+                st.markdown("**📤 Alert Engine — Notification Sent**")
+                st.caption(
+                    "Prototype notice: no real email/SMS is sent — this shows "
+                    "what the Alert Engine would dispatch to a field "
+                    "technician in a production deployment."
+                )
+                tab_email, tab_sms = st.tabs(["📧 Email Preview", "📱 SMS Preview"])
+                with tab_email:
+                    em = latest_notif["email"]
+                    st.markdown(
+                        f"""
+                        <div style="border:1px solid #e2e8f0;border-radius:8px;
+                        padding:14px 16px;background-color:#ffffff;">
+                            <div style="color:#64748b;font-size:0.85rem;">To: {em['to']}</div>
+                            <div style="font-weight:700;color:#0f172a;margin:4px 0;">
+                                {em['subject']}
+                                <span class="status-badge" style="background-color:{sev['color']};
+                                margin-left:8px;">{sev['emoji']} {sev['label']}</span>
+                            </div>
+                            <pre style="white-space:pre-wrap;font-family:inherit;
+                            color:#334155;font-size:0.9rem;margin:0;">{em['body']}</pre>
+                        </div>
+                        """,
+                        unsafe_allow_html=True,
+                    )
+                with tab_sms:
+                    sm = latest_notif["sms"]
+                    st.markdown(
+                        f"""
+                        <div style="border:1px solid #e2e8f0;border-radius:8px;
+                        padding:14px 16px;background-color:#ffffff;max-width:340px;">
+                            <div style="color:#64748b;font-size:0.85rem;">To: {sm['to']}</div>
+                            <div style="background-color:#f1f5f9;border-radius:8px;
+                            padding:10px 12px;margin-top:6px;color:#0f172a;">{sm['text']}</div>
+                        </div>
+                        """,
+                        unsafe_allow_html=True,
+                    )
 
-with tab_dashboard:
-    render_live_dashboard()
+        # ------------------------------------------------------------
+        # Anomaly history table
+        # ------------------------------------------------------------
+        st.subheader("🗂️ Anomaly History")
+        table = history_to_display_table(station["anomaly_log"])
+        if len(table):
+            st.dataframe(table, use_container_width=True, hide_index=True)
+        else:
+            st.caption("No anomalies logged yet. Use the sidebar to inject one.")
+
+        if station["notification_log"]:
+            with st.expander(f"📤 Notification Log ({len(station['notification_log'])} alerts sent)"):
+                for n in reversed(station["notification_log"][-20:]):
+                    sev = n["email"]["severity"]
+                    st.markdown(
+                        f"{sev['emoji']} **{n['time'].strftime('%H:%M:%S')}** — "
+                        f"{n['email']['subject']} *(email + SMS)*"
+                    )
 
 # ===========================================================================
 # TAB 2 — SYSTEM ARCHITECTURE
@@ -1006,7 +746,13 @@ with tab_metrics:
             "`python ml/evaluate_model.py` from the project root."
         )
 
-# NOTE: the old bottom-of-script "time.sleep(AUTO_REFRESH_SECONDS) +
-# st.rerun()" block has been removed. The @st.fragment(run_every=...) on
-# render_live_dashboard() now handles periodic refresh on its own, without
-# rerunning (and flashing) the whole page.
+# ===========================================================================
+# LIVE AUTO-REFRESH LOOP
+# ===========================================================================
+# When the "Live auto-refresh" toggle is on, wait a couple of seconds and
+# then trigger a full script rerun, which (because auto_run is still True)
+# generates a fresh reading at the top of this same run. This is the
+# standard sleep + rerun pattern used for "live" updates in Streamlit.
+if station["auto_run"]:
+    time.sleep(AUTO_REFRESH_SECONDS)
+    st.rerun()
