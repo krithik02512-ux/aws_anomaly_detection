@@ -1,190 +1,277 @@
-"""
-train_model.py
-================
-Generates a realistic synthetic dataset that represents NORMAL Automatic
-Weather Station (AWS) sensor behaviour, and trains an unsupervised
-Isolation Forest model on it.
+# AI-Powered Automatic Weather Station (AWS) Monitoring
+### Intelligent Multi-Sensor Anomaly Detection — Working Prototype
 
-Why Isolation Forest?
-----------------------
-- We do NOT have labelled "anomaly / not anomaly" data from a real AWS,
-  so a supervised model (which needs labels) is not appropriate.
-- Isolation Forest is an unsupervised algorithm that learns what "normal"
-  combinations of sensor readings look like, and isolates points that are
-  easy to separate from the rest (few random splits needed) -> those are
-  flagged as anomalies.
-- It works well with small/medium tabular data, is fast to train, and is
-  simple enough for a 2nd-year engineering student to explain in a demo:
-  "the model learned the normal pattern of 5 sensors together, and flags
-  any new reading that doesn't fit that learned pattern."
+> ⚠️ **Note on scope:** The official problem statement for this competition only
+> provides the title *"AI/ML-Based Intelligent Anomaly Detection for Automatic
+> Weather Stations (AWS)."* Everything below — the specific features, ML
+> approach, architecture and UI — is **our team's proposed solution**, not an
+> official requirement.
 
-Output artefacts (saved to ml/model.pkl):
-    - model            : trained IsolationForest
-    - scaler           : StandardScaler fit on the training features
-    - feature_names    : ordered list of feature names used by the model
-    - feature_stats    : per-feature mean/std/min/max (used later to
-                          explain WHICH parameter looks suspicious)
-    - score_bounds     : min/max of the raw decision_function scores seen
-                          during training, used to rescale the anomaly
-                          score into an easy-to-read 0-100 range.
+---
 
-Also writes: data/weather_data.csv (the synthetic training dataset).
-"""
+## 1. Project Overview
 
-import os
-import numpy as np
-import pandas as pd
-from sklearn.ensemble import IsolationForest
-from sklearn.preprocessing import StandardScaler
-import joblib
+Automatic Weather Stations (AWS) run unattended for long periods and report
+readings (temperature, humidity, pressure, wind speed, rainfall) with no
+human nearby to notice if a sensor starts misbehaving. This prototype is a
+web-based monitoring system that:
 
-# ---------------------------------------------------------------------------
-# Reproducibility
-# ---------------------------------------------------------------------------
-RANDOM_SEED = 42
-np.random.seed(RANDOM_SEED)
+1. Simulates live AWS sensor data (since we don't have physical hardware yet).
+2. Feeds every new reading through a trained **unsupervised ML model**
+   (Isolation Forest) that has learned what a "normal" combination of the
+   5 sensors looks like.
+3. Flags readings that don't fit the learned normal pattern.
+4. Identifies **which sensor** is most likely responsible for the anomaly.
+5. Displays everything on a live monitoring dashboard, with an explainable
+   alert and history log.
 
-FEATURE_NAMES = ["temperature", "humidity", "pressure", "wind_speed", "rainfall"]
+This is **not** primarily a weather-forecasting app — the objective is
+anomaly detection, not predicting tomorrow's weather.
 
+## 2. Problem Definition
 
-def generate_normal_weather_data(n_samples: int = 5000) -> pd.DataFrame:
-    """
-    Generates realistic-looking NORMAL weather-station data.
+A single out-of-range threshold on one sensor (e.g. "alert if temperature
+> 50°C") misses a large and important class of problems:
 
-    The physical relationships modelled (kept intentionally simple):
-    - Temperature follows a daily sinusoidal cycle (cooler at night,
-      warmer in the afternoon) + small random noise.
-    - Humidity is loosely INVERSE to temperature (hot afternoons tend to
-      be less humid) + noise, clipped to a realistic band.
-    - Pressure stays close to a stable baseline (~1010 hPa) with slow,
-      small drifts - real atmospheric pressure rarely jumps quickly.
-    - Wind speed is drawn from a skewed (exponential-like) distribution
-      since calm conditions are more common than strong wind.
-    - Rainfall is mostly 0, with occasional rain "events" - rainfall is
-      not continuous, it happens in bursts.
+- It can't tell when a sensor looks wrong **relative to the other sensors**
+  at that same moment, rather than relative to a fixed number.
+- It can't distinguish "this looks like a plausible unusual weather event"
+  from "this looks like an isolated sensor glitch."
+- It gives no sense of *how* abnormal a reading is, just a binary yes/no.
 
-    These relationships are what the Isolation Forest implicitly learns.
-    A reading that breaks this learned joint pattern (e.g. temperature
-    spikes while everything else stays put) will look "isolated" and get
-    flagged.
-    """
-    t = np.arange(n_samples)
+## 3. Proposed Solution
 
-    # --- Temperature: daily cycle between ~22C and ~34C + noise ---
-    daily_cycle = np.sin(2 * np.pi * (t % 288) / 288)  # 288 = readings/day if 5-min interval
-    temperature = 28 + 6 * daily_cycle + np.random.normal(0, 0.8, n_samples)
+Use an unsupervised anomaly-detection model trained on the joint behaviour
+of all 5 sensors together, so the system can catch:
 
-    # --- Humidity: inversely related to temperature, clipped 30-95% ---
-    humidity = 75 - 4 * daily_cycle + np.random.normal(0, 3, n_samples)
-    humidity = np.clip(humidity, 30, 95)
+- **Single-sensor faults**: one sensor value far outside anything ever seen,
+  while the rest of the station reports normally.
+- **Unusual multi-parameter conditions**: several sensors shifting together
+  in a way that's statistically unusual, which the system flags for human
+  verification rather than confidently calling it a "fault."
 
-    # --- Pressure: stable baseline with slow random-walk drift ---
-    pressure_drift = np.cumsum(np.random.normal(0, 0.05, n_samples))
-    pressure_drift = np.clip(pressure_drift, -8, 8)  # keep drift bounded
-    pressure = 1010 + pressure_drift + np.random.normal(0, 0.3, n_samples)
+## 4. Key Differentiators
 
-    # --- Wind speed: skewed distribution, mostly calm/light wind ---
-    wind_speed = np.random.gamma(shape=2.0, scale=6.0, size=n_samples)
-    wind_speed = np.clip(wind_speed, 0, 45)
+This prototype is **not** claiming to invent AI-based weather anomaly
+detection. What differentiates our implementation:
 
-    # --- Rainfall: mostly dry, occasional rain bursts ---
-    rain_event = np.random.random(n_samples) < 0.06  # ~6% of readings have rain
-    rainfall = np.where(
-        rain_event,
-        np.random.exponential(scale=4.0, size=n_samples),
-        0.0,
-    )
-    rainfall = np.clip(rainfall, 0, 40)
+1. **Multi-sensor analysis** — all 5 parameters are analysed jointly, not
+   one at a time.
+2. **Anomaly scoring** — a continuous 0–100 score, not just a binary flag.
+3. **Suspicious-parameter identification** — the system points at *which*
+   sensor is most likely responsible.
+4. **Explainable alerts** — every alert includes a plain-language reason
+   (e.g. "Temperature reading significantly deviates X standard deviations
+   above the learned normal average").
+5. **Interactive anomaly injection** — live, on-demand demonstration
+   controls for a competition demo.
+6. **Clean real-time dashboard** — built to be understood by judges within
+   about 10 seconds of looking at it.
 
-    df = pd.DataFrame(
-        {
-            "timestamp": pd.date_range(
-                end=pd.Timestamp.now(), periods=n_samples, freq="5min"
-            ),
-            "temperature": np.round(temperature, 2),
-            "humidity": np.round(humidity, 2),
-            "pressure": np.round(pressure, 2),
-            "wind_speed": np.round(wind_speed, 2),
-            "rainfall": np.round(rainfall, 2),
-        }
-    )
-    return df
+## 5. System Architecture
 
+```
+Virtual Sensors
+      ↓
+Data Acquisition
+      ↓
+Data Preprocessing
+      ↓
+ML Anomaly Detection  (Isolation Forest)
+      ↓
+Anomaly Score (0–100)
+      ↓
+Parameter Identification  (z-score analysis)
+      ↓
+Alert Engine
+      ↓
+Dashboard
+```
 
-def train_and_save_model(df: pd.DataFrame, model_path: str):
-    """Trains the IsolationForest + StandardScaler and saves everything
-    needed for inference (including stats used for explainability)."""
+This same diagram, plus a plain-language explanation of the ML model, is
+also shown inside the app on the **"System Architecture"** tab.
 
-    X = df[FEATURE_NAMES].values
+## 6. Technology Stack
 
-    # Scale features so no single sensor (e.g. pressure ~1010) dominates
-    # the distance/split calculations just because of its larger numbers.
-    scaler = StandardScaler()
-    X_scaled = scaler.fit_transform(X)
+| Layer          | Technology                          |
+|----------------|--------------------------------------|
+| Dashboard/UI   | Streamlit                            |
+| Charts         | Plotly                               |
+| ML             | scikit-learn (Isolation Forest)      |
+| Data handling  | Pandas, NumPy                        |
+| Data storage   | CSV (synthetic dataset)              |
+| Model storage  | joblib (`ml/model.pkl`)              |
 
-    # contamination = expected proportion of anomalies in training data.
-    # We trained on data we generated as "normal", so we set this low -
-    # it just tells the model how strict its internal decision boundary
-    # should be.
-    model = IsolationForest(
-        n_estimators=200,
-        contamination=0.02,
-        max_samples="auto",
-        random_state=RANDOM_SEED,
-    )
-    model.fit(X_scaled)
+No React/Node/databases/Docker/cloud infrastructure — the goal is a
+prototype that runs on a normal student laptop with a single command.
 
-    # decision_function: higher = more "normal", lower/negative = more
-    # anomalous. We record the min/max seen on training data so we can
-    # later rescale any new score into an intuitive 0-100 range.
-    raw_scores = model.decision_function(X_scaled)
-    score_bounds = {
-        "min": float(raw_scores.min()),
-        "max": float(raw_scores.max()),
-        "std": float(raw_scores.std()),
-        "offset": float(model.offset_),  # the model's own inlier/outlier boundary
-    }
+## 7. Project Structure
 
-    # Per-feature statistics (on RAW, unscaled values) - used later to
-    # figure out WHICH sensor looks the most "off" for an anomalous
-    # reading (z-score based explainability).
-    feature_stats = {
-        name: {
-            "mean": float(df[name].mean()),
-            "std": float(df[name].std()),
-            "min": float(df[name].min()),
-            "max": float(df[name].max()),
-        }
-        for name in FEATURE_NAMES
-    }
+```
+aws_anomaly_detection/
+│
+├── app.py                      # Streamlit dashboard (main entry point)
+├── requirements.txt
+│
+├── data/
+│   └── weather_data.csv        # Synthetic "normal" training dataset
+│
+├── ml/
+│   ├── train_model.py          # Generates data + trains Isolation Forest
+│   ├── anomaly_detector.py     # Loads model, analyses readings, explains results
+│   ├── evaluate_model.py       # Builds a labelled test set + computes metrics
+│   ├── model.pkl               # Trained model + scaler + stats (generated)
+│   └── eval_results.json       # Precision/recall/F1/confusion matrix (generated)
+│
+├── simulation/
+│   └── sensor_simulator.py     # Virtual AWS sensor data generator
+│
+├── utils/
+│   └── data_processing.py      # Dashboard helper functions (trend, formatting)
+│
+└── README.md
+```
 
-    artefact = {
-        "model": model,
-        "scaler": scaler,
-        "feature_names": FEATURE_NAMES,
-        "feature_stats": feature_stats,
-        "score_bounds": score_bounds,
-    }
+## 8. Installation Instructions
 
-    os.makedirs(os.path.dirname(model_path), exist_ok=True)
-    joblib.dump(artefact, model_path)
-    print(f"[train_model] Model saved to {model_path}")
-    print(f"[train_model] Score bounds: {score_bounds}")
-    print(f"[train_model] Feature stats: {feature_stats}")
+**Requirements:** Python 3.9+ and internet access (only needed once, to
+install the packages below).
 
+```bash
+# 1. Move into the project folder
+cd aws_anomaly_detection
 
-if __name__ == "__main__":
-    base_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-    data_path = os.path.join(base_dir, "data", "weather_data.csv")
-    model_path = os.path.join(base_dir, "ml", "model.pkl")
+# 2. (Recommended) create a virtual environment
+python -m venv venv
+source venv/bin/activate        # On Windows: venv\Scripts\activate
 
-    print("[train_model] Generating synthetic NORMAL weather data...")
-    dataset = generate_normal_weather_data(n_samples=5000)
+# 3. Install dependencies
+pip install -r requirements.txt
+```
 
-    os.makedirs(os.path.dirname(data_path), exist_ok=True)
-    dataset.to_csv(data_path, index=False)
-    print(f"[train_model] Dataset saved to {data_path} ({len(dataset)} rows)")
+## 9. How to Run
 
-    print("[train_model] Training Isolation Forest model...")
-    train_and_save_model(dataset, model_path)
-    print("[train_model] Done.")
+```bash
+# Step 1: Train the model (generates data/weather_data.csv and ml/model.pkl)
+python ml/train_model.py
+
+# Step 2: Evaluate the model (generates ml/eval_results.json for the
+#          "Model Performance" tab in the dashboard)
+python ml/evaluate_model.py
+
+# Step 3: Launch the dashboard
+streamlit run app.py
+
+# Step 4: Open the URL Streamlit prints (usually http://localhost:8501)
+```
+
+> The app will also auto-generate `ml/model.pkl` the first time via
+> `train_model.py` — make sure Step 1 has been run at least once before
+> Step 2, or `app.py` will raise a clear error telling you to run it.
+
+## 10. How the ML Model Works
+
+- **Training data**: `ml/train_model.py` generates ~5,000 synthetic
+  *normal* readings with realistic relationships (daily temperature cycle,
+  humidity roughly inverse to temperature, slowly-drifting pressure, a
+  skewed wind-speed distribution, and bursty rainfall).
+- **Model**: an `IsolationForest` (200 trees) is trained on the 5
+  standardised features. Isolation Forest works by randomly partitioning
+  the data — points that sit apart from the rest get isolated into their
+  own partition in very few splits, while typical points take many splits.
+  That "ease of isolation" becomes the anomaly score.
+- **Anomaly score**: the model's raw score is rescaled to an intuitive
+  0–100 scale (0 = typical, 100 = extremely abnormal), centred on the
+  model's own decision boundary.
+- **Suspicious-parameter identification**: once a reading is flagged, the
+  system computes a z-score for each sensor against its learned normal
+  mean/std, and reports the sensor with the largest deviation as the
+  likely cause. If several sensors are notably off at once, it reports
+  *"unusual multi-parameter condition — requires verification"* instead of
+  blaming a single sensor.
+- **Statistical safety net**: Isolation Forest's split thresholds are
+  bounded to the range of values it saw during training, so in rare cases
+  a value that is wildly outside anything ever seen (e.g. a stuck sensor
+  reporting 65°C) might not get "isolated" quickly by the trees alone. To
+  keep detection reliable, the system also flags a reading if **any single
+  sensor** is more than 3.5 standard deviations from its learned normal
+  mean, regardless of what the ML model alone decided. This is a simple,
+  transparent rule layered **on top of** the ML model — not a replacement
+  for it — and it's easy to explain to judges: *"the ML model catches
+  unusual combinations; the statistical guardrail catches single-sensor
+  values so extreme the model never saw anything like them during
+  training."*
+
+## 11. How to Demonstrate Anomalies
+
+The sidebar has one button per sensor:
+
+```
+[🌡️ Temperature]  [💧 Humidity]  [🧭 Pressure]  [💨 Wind Speed]  [🌧️ Rainfall]
+[✅ Reset to Normal]
+```
+
+Recommended 2–3 minute demo flow:
+
+1. Open the dashboard — all 5 sensor cards show 🟢 **Normal** status.
+2. Point out the live trend graphs and explain the pipeline (see the
+   System Architecture tab).
+3. Click **Inject Temperature Anomaly**.
+4. Point out: sensor card turns red, the system banner switches to
+   🔴 **ANOMALY DETECTED**, the graph marks the anomalous point, and the
+   alert panel shows the detection time, value, anomaly score and a
+   plain-language explanation.
+5. Click **Reset to Normal** — banner returns to 🟢 within a couple of
+   readings.
+6. Repeat with a different sensor (e.g. **Inject Wind Anomaly**) to show
+   the system correctly identifies a *different* suspicious parameter each
+   time.
+7. Optionally, toggle **Live auto-refresh** to show the dashboard updating
+   continuously on its own.
+
+## 12. Limitations
+
+This is an engineering-fair **prototype**, and we are explicit about what
+it is *not*:
+
+- It uses **simulated/synthetic AWS data**, not certified meteorological
+  hardware or live weather data.
+- It does **not** guarantee it can always correctly distinguish a genuine
+  sensor fault from an unusual-but-real weather event — where several
+  sensors move together plausibly, it deliberately reports "requires
+  verification" rather than a confident diagnosis.
+- It is **not** a weather-forecasting or disaster-prediction system.
+- It is **not** production-deployment ready (no real sensor integration,
+  authentication, persistent database, or hardware failover).
+- Isolation Forest is trained only on the synthetic distribution we
+  generated; on real AWS field data the model would need to be retrained
+  on real historical sensor logs before being trusted.
+
+## 13. Future Improvements
+
+- Replace the virtual simulator with real AWS hardware / IoT sensor feed.
+- Retrain on real historical station data instead of synthetic data.
+- Add more sensors (e.g. solar radiation, soil moisture) as additional
+  features.
+- Compare Isolation Forest against other unsupervised approaches
+  (One-Class SVM, Autoencoders, Local Outlier Factor) for accuracy.
+- Add persistent storage (database) for long-term anomaly history and
+  reporting.
+- Add SMS/email alerting for field technicians.
+- Add per-station model calibration if deployed across multiple AWS units
+  with different local baselines.
+
+## 14. Troubleshooting
+
+| Problem | Fix |
+|---|---|
+| `FileNotFoundError: Trained model not found at ml/model.pkl` | Run `python ml/train_model.py` first. |
+| `ModuleNotFoundError: No module named 'streamlit'` (or pandas/sklearn/plotly) | Run `pip install -r requirements.txt` inside your virtual environment. |
+| Dashboard opens but looks empty | Click **Generate Next Reading** in the sidebar once. |
+| Port already in use | Run `streamlit run app.py --server.port 8502` (or any free port). |
+| Changes to `app.py` don't show up | Streamlit auto-reloads on save; if not, refresh the browser tab or restart `streamlit run app.py`. |
+
+---
+
+*Built as a functional engineering prototype: functionality first, then
+simplicity, then a professional UI — in that order of priority.*
