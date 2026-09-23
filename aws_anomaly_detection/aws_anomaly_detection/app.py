@@ -327,8 +327,8 @@ with st.sidebar:
     )
 
 # ---------------------------------------------------------------------------
-# Handle control actions (each triggers exactly one new reading, except
-# auto-run which generates one per refresh cycle below)
+# Handle manual control actions (buttons already cause a normal full rerun
+# when clicked, which is expected/fine — this is NOT the auto-refresh path).
 # ---------------------------------------------------------------------------
 reading_triggered = manual_generate
 
@@ -344,20 +344,34 @@ if reading_triggered:
     r = sim.generate_reading()
     process_reading(detector, station, r)
 
-if station["auto_run"]:
-    r = sim.generate_reading()
-    process_reading(detector, station, r)
-
-history: pd.DataFrame = station["history"]
-latest = history.iloc[-1] if len(history) else None
-
 # ===========================================================================
-# TAB 1 — LIVE DASHBOARD
+# TAB 1 — LIVE DASHBOARD (auto-refreshing fragment)
+# ---------------------------------------------------------------------------
+# FIX for the "blinking" bug: this used to be driven by a bottom-of-script
+# `time.sleep(AUTO_REFRESH_SECONDS); st.rerun()` block, which reran the
+# ENTIRE app (sidebar, header, tabs, everything) every 2 seconds — causing
+# the whole page to visibly flash/blink on every refresh.
+#
+# `st.fragment(run_every=...)` reruns ONLY this function on its own timer,
+# leaving the rest of the page untouched, so only the live numbers/graph
+# update quietly instead of the whole screen blinking.
 # ===========================================================================
-with tab_dashboard:
-    if latest is None:
-        st.info("Click **Generate Next Reading** in the sidebar to start the simulation.")
-    else:
+@st.fragment(run_every=AUTO_REFRESH_SECONDS)
+def live_dashboard_fragment():
+    station = get_station_state(st.session_state.selected_station)
+
+    if station["auto_run"]:
+        r = station["simulator"].generate_reading()
+        process_reading(detector, station, r)
+
+    history: pd.DataFrame = station["history"]
+    latest = history.iloc[-1] if len(history) else None
+
+    with tab_dashboard:
+        if latest is None:
+            st.info("Click **Generate Next Reading** in the sidebar to start the simulation.")
+            return
+
         # ------------------------------------------------------------
         # System status banner
         # ------------------------------------------------------------
@@ -573,8 +587,11 @@ with tab_dashboard:
                         f"{n['email']['subject']} *(email + SMS)*"
                     )
 
+
+live_dashboard_fragment()
+
 # ===========================================================================
-# TAB 2 — SYSTEM ARCHITECTURE
+# TAB 2 — SYSTEM ARCHITECTURE (static — no need to auto-refresh)
 # ===========================================================================
 with tab_architecture:
     st.subheader("System Architecture")
@@ -644,7 +661,7 @@ a technician straight at the sensor most likely responsible.
     )
 
 # ===========================================================================
-# TAB 3 — MODEL PERFORMANCE
+# TAB 3 — MODEL PERFORMANCE (static — no need to auto-refresh)
 # ===========================================================================
 with tab_metrics:
     st.subheader("📐 Model Performance")
@@ -745,14 +762,3 @@ with tab_metrics:
             "To regenerate these results after retraining the model, run "
             "`python ml/evaluate_model.py` from the project root."
         )
-
-# ===========================================================================
-# LIVE AUTO-REFRESH LOOP
-# ===========================================================================
-# When the "Live auto-refresh" toggle is on, wait a couple of seconds and
-# then trigger a full script rerun, which (because auto_run is still True)
-# generates a fresh reading at the top of this same run. This is the
-# standard sleep + rerun pattern used for "live" updates in Streamlit.
-if station["auto_run"]:
-    time.sleep(AUTO_REFRESH_SECONDS)
-    st.rerun()
