@@ -119,7 +119,9 @@ aws_anomaly_detection/
 ├── ml/
 │   ├── train_model.py          # Generates data + trains Isolation Forest
 │   ├── anomaly_detector.py     # Loads model, analyses readings, explains results
-│   └── model.pkl               # Trained model + scaler + stats (generated)
+│   ├── evaluate_model.py       # Builds a labelled test set + computes metrics
+│   ├── model.pkl               # Trained model + scaler + stats (generated)
+│   └── eval_results.json       # Precision/recall/F1/confusion matrix (generated)
 │
 ├── simulation/
 │   └── sensor_simulator.py     # Virtual AWS sensor data generator
@@ -153,10 +155,14 @@ pip install -r requirements.txt
 # Step 1: Train the model (generates data/weather_data.csv and ml/model.pkl)
 python ml/train_model.py
 
-# Step 2: Launch the dashboard
+# Step 2: Evaluate the model (generates ml/eval_results.json for the
+#          "Model Performance" tab in the dashboard)
+python ml/evaluate_model.py
+
+# Step 3: Launch the dashboard
 streamlit run app.py
 
-# Step 3: Open the URL Streamlit prints (usually http://localhost:8501)
+# Step 4: Open the URL Streamlit prints (usually http://localhost:8501)
 ```
 
 > The app will also auto-generate `ml/model.pkl` the first time via
