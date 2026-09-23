@@ -30,11 +30,19 @@ import os
 import sys
 import time
 from datetime import datetime
+from io import BytesIO
 
 import pandas as pd
 import plotly.graph_objects as go
 from plotly.subplots import make_subplots
 import streamlit as st
+from reportlab.lib.pagesizes import A4
+from reportlab.lib import colors
+from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
+from reportlab.lib.units import mm
+from reportlab.platypus import (
+    SimpleDocTemplate, Table, TableStyle, Paragraph, Spacer, HRFlowable
+)
 
 # ---------------------------------------------------------------------------
 # Make sure local packages (ml/, simulation/, utils/) are importable
@@ -295,6 +303,97 @@ def verification_summary(anomaly_log: list) -> dict:
         "verified_total": verified_total,
         "accuracy": accuracy,
     }
+
+
+def generate_incident_report_pdf(station_label: str, entry: dict, row, contribution: dict,
+                                  param_labels: dict) -> bytes:
+    """Builds a one-page PDF incident report for a single anomaly: summary,
+    explanation, sensor-contribution breakdown, and technician verification
+    status — suitable to hand to a field team or attach to a logbook."""
+    buffer = BytesIO()
+    doc = SimpleDocTemplate(buffer, pagesize=A4, topMargin=20 * mm, bottomMargin=20 * mm,
+                             leftMargin=20 * mm, rightMargin=20 * mm)
+    styles = getSampleStyleSheet()
+    title_style = ParagraphStyle("ReportTitle", parent=styles["Title"], fontSize=18,
+                                  textColor=colors.HexColor("#0f172a"))
+    heading_style = ParagraphStyle("ReportHeading", parent=styles["Heading2"], fontSize=13,
+                                    textColor=colors.HexColor("#1e293b"), spaceBefore=6)
+    normal_style = styles["Normal"]
+    footer_style = ParagraphStyle("ReportFooter", parent=normal_style, fontSize=8,
+                                   textColor=colors.HexColor("#94a3b8"))
+
+    verification_display = {
+        "Unverified": "⏳ Pending technician review",
+        "Confirmed Fault": "✅ Confirmed Fault",
+        "False Alarm": "❌ False Alarm",
+    }.get(entry["verification"], entry["verification"])
+
+    elems = [
+        Paragraph("AWS Anomaly Incident Report", title_style),
+        Spacer(1, 3 * mm),
+        Paragraph(f"Station: <b>{station_label}</b>", normal_style),
+        Paragraph(f"Detected at: <b>{entry['time'].strftime('%Y-%m-%d %H:%M:%S')}</b>", normal_style),
+        Paragraph(f"Report generated: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}", normal_style),
+        Spacer(1, 5 * mm),
+        HRFlowable(width="100%", color=colors.HexColor("#cbd5e1")),
+        Spacer(1, 5 * mm),
+        Paragraph("Summary", heading_style),
+    ]
+
+    summary_table = Table(
+        [
+            ["Parameter", entry["parameter"]],
+            ["Value", str(entry["value"])],
+            ["Anomaly Score", f"{entry['score']:.1f} / 100"],
+            ["Status", entry["status"]],
+            ["Technician Verification", verification_display],
+        ],
+        colWidths=[55 * mm, 100 * mm],
+    )
+    summary_table.setStyle(TableStyle([
+        ("BACKGROUND", (0, 0), (0, -1), colors.HexColor("#f1f5f9")),
+        ("TEXTCOLOR", (0, 0), (-1, -1), colors.HexColor("#0f172a")),
+        ("FONTSIZE", (0, 0), (-1, -1), 10),
+        ("GRID", (0, 0), (-1, -1), 0.5, colors.HexColor("#e2e8f0")),
+        ("VALIGN", (0, 0), (-1, -1), "MIDDLE"),
+        ("TOPPADDING", (0, 0), (-1, -1), 6),
+        ("BOTTOMPADDING", (0, 0), (-1, -1), 6),
+    ]))
+    elems.append(summary_table)
+    elems.append(Spacer(1, 7 * mm))
+
+    elems.append(Paragraph("System Explanation", heading_style))
+    elems.append(Paragraph(row.get("explanation", "-") or "-", normal_style))
+    elems.append(Spacer(1, 7 * mm))
+
+    elems.append(Paragraph("Sensor Contribution Analysis", heading_style))
+    contrib_rows = [["Sensor", "Contribution to anomaly"]]
+    for p, pct in sorted(contribution.items(), key=lambda kv: -kv[1]):
+        contrib_rows.append([param_labels.get(p, p), f"{pct:.1f}%"])
+    contrib_table = Table(contrib_rows, colWidths=[75 * mm, 80 * mm])
+    contrib_table.setStyle(TableStyle([
+        ("BACKGROUND", (0, 0), (-1, 0), colors.HexColor("#0f172a")),
+        ("TEXTCOLOR", (0, 0), (-1, 0), colors.white),
+        ("FONTSIZE", (0, 0), (-1, -1), 10),
+        ("GRID", (0, 0), (-1, -1), 0.5, colors.HexColor("#e2e8f0")),
+        ("ROWBACKGROUNDS", (0, 1), (-1, -1), [colors.white, colors.HexColor("#f8fafc")]),
+        ("TOPPADDING", (0, 0), (-1, -1), 5),
+        ("BOTTOMPADDING", (0, 0), (-1, -1), 5),
+    ]))
+    elems.append(contrib_table)
+    elems.append(Spacer(1, 10 * mm))
+    elems.append(HRFlowable(width="100%", color=colors.HexColor("#cbd5e1")))
+    elems.append(Spacer(1, 4 * mm))
+    elems.append(Paragraph(
+        "Prototype notice: generated from simulated/synthetic AWS sensor data as part of "
+        "a college engineering demonstration. Not a certified meteorological or "
+        "safety-critical report.",
+        footer_style,
+    ))
+
+    doc.build(elems)
+    buffer.seek(0)
+    return buffer.getvalue()
 
 
 init_state()
@@ -595,6 +694,22 @@ def render_live_dashboard():
                     st.success("✅ Verified by technician: **Confirmed Fault**")
                 else:
                     st.warning("❌ Verified by technician: **False Alarm**")
+
+                pdf_bytes = generate_incident_report_pdf(
+                    STATION_LABELS[st.session_state.selected_station],
+                    entry, latest, contribution, PARAM_LABELS,
+                )
+                st.download_button(
+                    "📄 Download Incident Report (PDF)",
+                    data=pdf_bytes,
+                    file_name=(
+                        f"{st.session_state.selected_station}_incident_{entry['id']}_"
+                        f"{latest['timestamp'].strftime('%Y%m%d_%H%M%S')}.pdf"
+                    ),
+                    mime="application/pdf",
+                    use_container_width=True,
+                    key=f"pdf_{entry['id']}",
+                )
 
         # --------------------------------------------------------
         # Alert Engine — simulated notification preview
