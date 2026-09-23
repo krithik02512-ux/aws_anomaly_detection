@@ -524,40 +524,6 @@ def live_dashboard_fragment():
                     "reported as the likely cause."
                 )
 
-                # ----------------------------------------------------
-                # Human Verification — field technician feedback loop
-                # ----------------------------------------------------
-                st.markdown("**🧑‍🔧 Human Verification**")
-                latest_entry = station["anomaly_log"][-1] if station["anomaly_log"] else None
-                if latest_entry is not None:
-                    v_status = latest_entry.get("verification", "Pending")
-                    entry_key = f"{st.session_state.selected_station}_{latest['timestamp'].isoformat()}"
-
-                    if v_status == "Pending":
-                        st.caption(
-                            "Has a field technician checked this reading? Your feedback "
-                            "helps track how reliable the system's alerts really are."
-                        )
-                        vb1, vb2 = st.columns(2)
-                        with vb1:
-                            if st.button("✅ Confirm Fault", key=f"confirm_{entry_key}",
-                                         use_container_width=True):
-                                latest_entry["verification"] = "Confirmed Fault"
-                                st.rerun()
-                        with vb2:
-                            if st.button("❌ False Alarm", key=f"falsealarm_{entry_key}",
-                                         use_container_width=True):
-                                latest_entry["verification"] = "False Alarm"
-                                st.rerun()
-                    else:
-                        badge_color = "#16a34a" if v_status == "Confirmed Fault" else "#f59e0b"
-                        st.markdown(
-                            f'<span class="status-badge" style="background-color:{badge_color};">'
-                            f'{v_status}</span>',
-                            unsafe_allow_html=True,
-                        )
-                        st.caption("Reviewed by technician for this reading.")
-
             # --------------------------------------------------------
             # Alert Engine — simulated notification preview
             # --------------------------------------------------------
@@ -632,6 +598,42 @@ def live_dashboard_fragment():
 
 
 live_dashboard_fragment()
+
+# ---------------------------------------------------------------------------
+# Human Verification — field technician feedback loop.
+#
+# Deliberately placed OUTSIDE live_dashboard_fragment(). Buttons inside a
+# st.fragment(run_every=...) can have their click silently dropped when the
+# 2-second auto-timer rerun fires at nearly the same moment as the click.
+# Placing the buttons here means they only rerun on a normal full-page
+# rerun (triggered by the click itself), which never races the timer.
+# ---------------------------------------------------------------------------
+with tab_dashboard:
+    verify_station = get_station_state(st.session_state.selected_station)
+    if verify_station["anomaly_log"]:
+        latest_anomaly_entry = verify_station["anomaly_log"][-1]
+        v_status = latest_anomaly_entry.get("verification", "Pending")
+
+        st.divider()
+        st.markdown("**🧑‍🔧 Human Verification** — has a field technician checked the most recent alert?")
+
+        if v_status == "Pending":
+            vb1, vb2, vb3 = st.columns([1, 1, 3])
+            with vb1:
+                if st.button("✅ Confirm Fault", use_container_width=True, key="confirm_verify_btn"):
+                    latest_anomaly_entry["verification"] = "Confirmed Fault"
+                    st.rerun()
+            with vb2:
+                if st.button("❌ False Alarm", use_container_width=True, key="falsealarm_verify_btn"):
+                    latest_anomaly_entry["verification"] = "False Alarm"
+                    st.rerun()
+        else:
+            badge_color = "#16a34a" if v_status == "Confirmed Fault" else "#f59e0b"
+            st.markdown(
+                f'<span class="status-badge" style="background-color:{badge_color};">{v_status}</span>',
+                unsafe_allow_html=True,
+            )
+            st.caption("This alert has already been reviewed.")
 
 # ===========================================================================
 # TAB 2 — SYSTEM ARCHITECTURE (static — no need to auto-refresh)
