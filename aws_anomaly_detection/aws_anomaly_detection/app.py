@@ -212,6 +212,7 @@ def process_reading(detector: AnomalyDetector, station: dict, reading: dict) -> 
                 "value": format_value(result.suspicious_param, reading[result.suspicious_param]) if result.suspicious_param else "-",
                 "score": result.anomaly_score,
                 "status": "Multi-parameter" if result.is_multi_parameter else "Anomaly",
+                "verification": "Pending",
             }
         )
         station["anomaly_log"] = station["anomaly_log"][-100:]
@@ -523,6 +524,40 @@ def live_dashboard_fragment():
                     "reported as the likely cause."
                 )
 
+                # ----------------------------------------------------
+                # Human Verification — field technician feedback loop
+                # ----------------------------------------------------
+                st.markdown("**🧑‍🔧 Human Verification**")
+                latest_entry = station["anomaly_log"][-1] if station["anomaly_log"] else None
+                if latest_entry is not None:
+                    v_status = latest_entry.get("verification", "Pending")
+                    entry_key = f"{st.session_state.selected_station}_{latest['timestamp'].isoformat()}"
+
+                    if v_status == "Pending":
+                        st.caption(
+                            "Has a field technician checked this reading? Your feedback "
+                            "helps track how reliable the system's alerts really are."
+                        )
+                        vb1, vb2 = st.columns(2)
+                        with vb1:
+                            if st.button("✅ Confirm Fault", key=f"confirm_{entry_key}",
+                                         use_container_width=True):
+                                latest_entry["verification"] = "Confirmed Fault"
+                                st.rerun()
+                        with vb2:
+                            if st.button("❌ False Alarm", key=f"falsealarm_{entry_key}",
+                                         use_container_width=True):
+                                latest_entry["verification"] = "False Alarm"
+                                st.rerun()
+                    else:
+                        badge_color = "#16a34a" if v_status == "Confirmed Fault" else "#f59e0b"
+                        st.markdown(
+                            f'<span class="status-badge" style="background-color:{badge_color};">'
+                            f'{v_status}</span>',
+                            unsafe_allow_html=True,
+                        )
+                        st.caption("Reviewed by technician for this reading.")
+
             # --------------------------------------------------------
             # Alert Engine — simulated notification preview
             # --------------------------------------------------------
@@ -574,6 +609,14 @@ def live_dashboard_fragment():
         st.subheader("🗂️ Anomaly History")
         table = history_to_display_table(station["anomaly_log"])
         if len(table):
+            # Attach verification status per row if the display table
+            # doesn't already carry it (history_to_display_table may only
+            # forward a subset of keys from anomaly_log).
+            if "verification" not in table.columns and len(table) == len(station["anomaly_log"]):
+                table = table.copy()
+                table["Verification"] = [
+                    e.get("verification", "Pending") for e in station["anomaly_log"]
+                ]
             st.dataframe(table, use_container_width=True, hide_index=True)
         else:
             st.caption("No anomalies logged yet. Use the sidebar to inject one.")
@@ -762,3 +805,41 @@ with tab_metrics:
             "To regenerate these results after retraining the model, run "
             "`python ml/evaluate_model.py` from the project root."
         )
+
+        # ------------------------------------------------------------
+        # Human Verification Feedback — real-world field accuracy,
+        # separate from the offline metrics above which are computed
+        # on a synthetic labelled test set.
+        # ------------------------------------------------------------
+        st.write("")
+        st.subheader("🧑‍🔧 Human Verification Feedback")
+        st.caption(
+            f"Field-technician review results for **{STATION_LABELS[st.session_state.selected_station]}** "
+            "— based on Confirm Fault / False Alarm feedback given on live alerts, "
+            "as opposed to the offline synthetic evaluation above."
+        )
+        live_station = get_station_state(st.session_state.selected_station)
+        v_counts = {"Confirmed Fault": 0, "False Alarm": 0, "Pending": 0}
+        for entry in live_station["anomaly_log"]:
+            status = entry.get("verification", "Pending")
+            v_counts[status] = v_counts.get(status, 0) + 1
+
+        vc1, vc2, vc3 = st.columns(3)
+        vc1.metric("✅ Confirmed Faults", v_counts["Confirmed Fault"])
+        vc2.metric("❌ False Alarms", v_counts["False Alarm"])
+        vc3.metric("⏳ Pending Review", v_counts["Pending"])
+
+        reviewed = v_counts["Confirmed Fault"] + v_counts["False Alarm"]
+        if reviewed > 0:
+            field_precision = v_counts["Confirmed Fault"] / reviewed * 100
+            st.progress(
+                v_counts["Confirmed Fault"] / reviewed,
+                text=f"Field-verified precision: {field_precision:.0f}% "
+                     f"({reviewed} alert{'s' if reviewed != 1 else ''} reviewed so far)",
+            )
+        else:
+            st.caption(
+                "No alerts have been reviewed by a technician yet for this station. "
+                "Go to the Live Dashboard tab, trigger an anomaly, and use the "
+                "Confirm Fault / False Alarm buttons to start building this record."
+            )
