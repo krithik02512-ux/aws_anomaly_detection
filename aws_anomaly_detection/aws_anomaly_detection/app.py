@@ -58,6 +58,19 @@ PARAM_LABELS = {
 MAX_HISTORY_ROWS = 200
 AUTO_REFRESH_SECONDS = 2
 
+# Virtual AWS network: each station gets its own simulator/history/logs so
+# they operate completely independently, the way real field stations would.
+# The seed differs per station only so their live demo data streams look
+# distinct from each other (not to change what counts as "normal" -
+# they all share the same trained model and learned normal ranges).
+STATIONS = [
+    {"id": "AWS-STN-01", "name": "AWS-STN-01 — Chennai", "seed": 7},
+    {"id": "AWS-STN-02", "name": "AWS-STN-02 — Coimbatore", "seed": 21},
+    {"id": "AWS-STN-03", "name": "AWS-STN-03 — Madurai", "seed": 35},
+]
+STATION_IDS = [s["id"] for s in STATIONS]
+STATION_LABELS = {s["id"]: s["name"] for s in STATIONS}
+
 # ---------------------------------------------------------------------------
 # Page config + light styling
 # ---------------------------------------------------------------------------
@@ -146,26 +159,35 @@ def load_detector() -> AnomalyDetector:
 
 
 def init_state():
-    if "simulator" not in st.session_state:
-        st.session_state.simulator = SensorSimulator(seed=7)
-    if "history" not in st.session_state:
-        st.session_state.history = pd.DataFrame(
-            columns=["timestamp"] + PARAMS + ["is_anomaly", "anomaly_score",
-                                               "suspicious_param", "explanation",
-                                               "is_multi_parameter"]
-        )
-    if "anomaly_log" not in st.session_state:
-        st.session_state.anomaly_log = []
-    if "notification_log" not in st.session_state:
-        st.session_state.notification_log = []
-    if "auto_run" not in st.session_state:
-        st.session_state.auto_run = False
-    if "warmed_up" not in st.session_state:
-        st.session_state.warmed_up = False
+    if "stations" not in st.session_state:
+        st.session_state.stations = {}
+    if "selected_station" not in st.session_state:
+        st.session_state.selected_station = STATION_IDS[0]
 
 
-def process_reading(detector: AnomalyDetector, reading: dict) -> AnomalyResult:
-    """Runs one reading through the full pipeline and logs it."""
+def get_station_state(station_id: str) -> dict:
+    """Lazily creates and returns the isolated state (simulator, history,
+    anomaly log, notification log) for one AWS station."""
+    if station_id not in st.session_state.stations:
+        seed = next(s["seed"] for s in STATIONS if s["id"] == station_id)
+        st.session_state.stations[station_id] = {
+            "simulator": SensorSimulator(seed=seed),
+            "history": pd.DataFrame(
+                columns=["timestamp"] + PARAMS + ["is_anomaly", "anomaly_score",
+                                                   "suspicious_param", "explanation",
+                                                   "is_multi_parameter"]
+            ),
+            "anomaly_log": [],
+            "notification_log": [],
+            "auto_run": False,
+            "warmed_up": False,
+        }
+    return st.session_state.stations[station_id]
+
+
+def process_reading(detector: AnomalyDetector, station: dict, reading: dict) -> AnomalyResult:
+    """Runs one reading through the full pipeline and logs it against the
+    given station's own history/anomaly/notification logs."""
     features = {p: reading[p] for p in PARAMS}
     result = detector.analyze(features)
 
@@ -178,12 +200,12 @@ def process_reading(detector: AnomalyDetector, reading: dict) -> AnomalyResult:
         "explanation": result.explanation,
         "is_multi_parameter": result.is_multi_parameter,
     }
-    st.session_state.history = pd.concat(
-        [st.session_state.history, pd.DataFrame([row])], ignore_index=True
+    station["history"] = pd.concat(
+        [station["history"], pd.DataFrame([row])], ignore_index=True
     ).tail(MAX_HISTORY_ROWS)
 
     if result.is_anomaly:
-        st.session_state.anomaly_log.append(
+        station["anomaly_log"].append(
             {
                 "time": reading["timestamp"],
                 "parameter": PARAM_LABELS.get(result.suspicious_param, "Multiple") if not result.is_multi_parameter else "Multiple",
@@ -192,7 +214,7 @@ def process_reading(detector: AnomalyDetector, reading: dict) -> AnomalyResult:
                 "status": "Multi-parameter" if result.is_multi_parameter else "Anomaly",
             }
         )
-        st.session_state.anomaly_log = st.session_state.anomaly_log[-100:]
+        station["anomaly_log"] = station["anomaly_log"][-100:]
 
         # --- Alert Engine: build the notification that WOULD be sent ---
         param_label = PARAM_LABELS.get(result.suspicious_param, "Unknown") if result.suspicious_param else "Unknown"
@@ -215,31 +237,35 @@ def process_reading(detector: AnomalyDetector, reading: dict) -> AnomalyResult:
             anomaly_score=result.anomaly_score,
             is_multi_parameter=result.is_multi_parameter,
         )
-        st.session_state.notification_log.append(
+        station["notification_log"].append(
             {"time": reading["timestamp"], "email": email, "sms": sms}
         )
-        st.session_state.notification_log = st.session_state.notification_log[-50:]
+        station["notification_log"] = station["notification_log"][-50:]
 
     return result
 
 
 init_state()
 detector = load_detector()
-sim: SensorSimulator = st.session_state.simulator
+station = get_station_state(st.session_state.selected_station)
+sim: SensorSimulator = station["simulator"]
 
 # Warm up with a short run of normal data so the dashboard isn't empty
-# the first time it's opened.
-if not st.session_state.warmed_up:
+# the first time this station is opened.
+if not station["warmed_up"]:
     for _ in range(20):
         r = sim.generate_reading()
-        process_reading(detector, r)
-    st.session_state.warmed_up = True
+        process_reading(detector, station, r)
+    station["warmed_up"] = True
 
 # ---------------------------------------------------------------------------
 # Header
 # ---------------------------------------------------------------------------
 st.title("🛰️ AI-Powered Automatic Weather Station Monitoring")
-st.caption("Intelligent Multi-Sensor Anomaly Detection")
+st.caption(
+    f"Intelligent Multi-Sensor Anomaly Detection  |  "
+    f"📡 Monitoring: **{STATION_LABELS[st.session_state.selected_station]}**"
+)
 
 tab_dashboard, tab_architecture, tab_metrics = st.tabs(
     ["📊 Live Dashboard", "🏗️ System Architecture", "📐 Model Performance"]
@@ -249,11 +275,24 @@ tab_dashboard, tab_architecture, tab_metrics = st.tabs(
 # SIDEBAR — Simulation Controls
 # ===========================================================================
 with st.sidebar:
+    st.header("🛰️ AWS Station Network")
+    selected = st.selectbox(
+        "Select station", options=STATION_IDS,
+        format_func=lambda sid: STATION_LABELS[sid],
+        index=STATION_IDS.index(st.session_state.selected_station),
+        help="Each station runs its own independent virtual sensors and "
+             "anomaly history, sharing the same trained ML model."
+    )
+    if selected != st.session_state.selected_station:
+        st.session_state.selected_station = selected
+        st.rerun()
+
+    st.divider()
     st.header("⚙️ Simulation Controls")
     st.caption("Virtual AWS sensor simulator — no physical hardware required for this prototype.")
 
-    st.session_state.auto_run = st.toggle(
-        "▶ Live auto-refresh", value=st.session_state.auto_run,
+    station["auto_run"] = st.toggle(
+        "▶ Live auto-refresh", value=station["auto_run"],
         help=f"Automatically generates a new reading every {AUTO_REFRESH_SECONDS}s."
     )
 
@@ -303,13 +342,13 @@ if reset_clicked:
 
 if reading_triggered:
     r = sim.generate_reading()
-    process_reading(detector, r)
+    process_reading(detector, station, r)
 
-if st.session_state.auto_run:
+if station["auto_run"]:
     r = sim.generate_reading()
-    process_reading(detector, r)
+    process_reading(detector, station, r)
 
-history: pd.DataFrame = st.session_state.history
+history: pd.DataFrame = station["history"]
 latest = history.iloc[-1] if len(history) else None
 
 # ===========================================================================
@@ -434,11 +473,47 @@ with tab_dashboard:
                 status_text = "Requires Verification" if latest["is_multi_parameter"] else "Suspicious Reading"
                 st.error(f"**Status:** {status_text}\n\n{latest['explanation']}")
 
+                # ----------------------------------------------------
+                # Feature Importance — which sensor drove this anomaly
+                # ----------------------------------------------------
+                st.markdown("**🔍 Sensor Contribution to This Anomaly**")
+                z_scores = {}
+                for p in PARAMS:
+                    stats = detector.feature_stats[p]
+                    std = stats["std"] if stats["std"] > 1e-6 else 1e-6
+                    z_scores[p] = abs((latest[p] - stats["mean"]) / std)
+                total_z = sum(z_scores.values()) or 1e-6
+                contribution = {p: (z / total_z) * 100 for p, z in z_scores.items()}
+                sorted_params = sorted(contribution, key=lambda p: contribution[p], reverse=True)
+
+                fi_fig = go.Figure(go.Bar(
+                    x=[contribution[p] for p in sorted_params],
+                    y=[PARAM_LABELS[p] for p in sorted_params],
+                    orientation="h",
+                    text=[f"{contribution[p]:.0f}%" for p in sorted_params],
+                    textposition="outside",
+                    marker_color=[
+                        "#dc2626" if p == latest["suspicious_param"] else "#93c5fd"
+                        for p in sorted_params
+                    ],
+                ))
+                fi_fig.update_layout(
+                    height=220, margin=dict(t=10, b=10, l=10, r=30),
+                    xaxis_title="Contribution to anomaly (%)",
+                    xaxis=dict(range=[0, max(contribution.values()) * 1.25]),
+                )
+                st.plotly_chart(fi_fig, use_container_width=True)
+                st.caption(
+                    "Based on how many standard deviations each sensor sits from its "
+                    "own learned normal range — the sensor with the largest share is "
+                    "reported as the likely cause."
+                )
+
             # --------------------------------------------------------
             # Alert Engine — simulated notification preview
             # --------------------------------------------------------
-            if st.session_state.notification_log:
-                latest_notif = st.session_state.notification_log[-1]
+            if station["notification_log"]:
+                latest_notif = station["notification_log"][-1]
                 sev = latest_notif["email"]["severity"]
                 st.markdown("**📤 Alert Engine — Notification Sent**")
                 st.caption(
@@ -483,15 +558,15 @@ with tab_dashboard:
         # Anomaly history table
         # ------------------------------------------------------------
         st.subheader("🗂️ Anomaly History")
-        table = history_to_display_table(st.session_state.anomaly_log)
+        table = history_to_display_table(station["anomaly_log"])
         if len(table):
             st.dataframe(table, use_container_width=True, hide_index=True)
         else:
             st.caption("No anomalies logged yet. Use the sidebar to inject one.")
 
-        if st.session_state.notification_log:
-            with st.expander(f"📤 Notification Log ({len(st.session_state.notification_log)} alerts sent)"):
-                for n in reversed(st.session_state.notification_log[-20:]):
+        if station["notification_log"]:
+            with st.expander(f"📤 Notification Log ({len(station['notification_log'])} alerts sent)"):
+                for n in reversed(station["notification_log"][-20:]):
                     sev = n["email"]["severity"]
                     st.markdown(
                         f"{sev['emoji']} **{n['time'].strftime('%H:%M:%S')}** — "
@@ -678,6 +753,6 @@ with tab_metrics:
 # then trigger a full script rerun, which (because auto_run is still True)
 # generates a fresh reading at the top of this same run. This is the
 # standard sleep + rerun pattern used for "live" updates in Streamlit.
-if st.session_state.auto_run:
+if station["auto_run"]:
     time.sleep(AUTO_REFRESH_SECONDS)
     st.rerun()
